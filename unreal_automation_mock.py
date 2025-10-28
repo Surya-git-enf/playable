@@ -1,19 +1,24 @@
 from fastapi import FastAPI
 from pydantic import BaseModel
-from fastapi.responses import JSONResponse, HTMLResponse
+from fastapi.responses import JSONResponse, HTMLResponse, FileResponse
+import os
 
 app = FastAPI()
 
-# In-memory game storage
-GAMES = {}
+# Use persistent directory (Render allows temporary storage during runtime)
+BASE_DIR = "/tmp/generated_games"
+os.makedirs(BASE_DIR, exist_ok=True)
 
 class ScriptInput(BaseModel):
     script: str
 
 @app.post("/build")
 async def build_game(data: ScriptInput):
-    game_name = data.script.replace(" ", "_").lower()[:25]
+    # Create filename from prompt
+    game_name = data.script.replace(" ", "_").lower()[:30]
+    file_path = os.path.join(BASE_DIR, f"{game_name}.html")
 
+    # Generate simple playable HTML
     html_content = f"""
     <!DOCTYPE html>
     <html>
@@ -24,9 +29,10 @@ async def build_game(data: ScriptInput):
                 margin: 0;
                 height: 100vh;
                 display: flex;
+                flex-direction: column;
                 align-items: center;
                 justify-content: center;
-                background: linear-gradient(135deg, #1a1a1a, #444);
+                background: linear-gradient(135deg, #111, #333);
                 color: white;
                 font-family: Arial;
             }}
@@ -35,45 +41,46 @@ async def build_game(data: ScriptInput):
                 height: 100px;
                 background: {'blue' if 'blue' in data.script.lower() else 'red'};
                 border-radius: {'50%' if 'circle' in data.script.lower() else '0'};
-                animation: spin {'1s' if 'fast' in data.script.lower() else '3s'} linear infinite;
+                animation: { 'spin 1s linear infinite' if 'fast' in data.script.lower() else 'spin 3s linear infinite' };
             }}
             @keyframes spin {{
-                0% {{ transform: rotate(0deg); }}
-                100% {{ transform: rotate(360deg); }}
+                from {{ transform: rotate(0deg); }}
+                to {{ transform: rotate(360deg); }}
             }}
         </style>
     </head>
     <body>
-        <div>
-            <h2>🎮 Game Preview</h2>
-            <div class="shape"></div>
-            <p>{data.script}</p>
-        </div>
+        <h2>🎮 Game Preview</h2>
+        <div class="shape"></div>
+        <p>{data.script}</p>
     </body>
     </html>
     """
 
-    # Store the game in memory
-    GAMES[game_name] = html_content
+    # Save HTML to file
+    with open(file_path, "w") as f:
+        f.write(html_content)
 
-    # Generate links
-    webgl_url = f"/preview/{game_name}"
-    apk_url = f"/download/{game_name}.apk"
+    base_url = "https://playable-36ab.onrender.com"
+    webgl_url = f"{base_url}/preview/{game_name}"
+    apk_url = f"{base_url}/download/{game_name}.apk"
 
     return JSONResponse({
         "webgl_url": webgl_url,
         "apk_url": apk_url
     })
 
-@app.get("/preview/{name}")
-async def preview_game(name: str):
-    if name not in GAMES:
-        return HTMLResponse("<h2>❌ Game not found!</h2>", status_code=404)
-    return HTMLResponse(GAMES[name])
+@app.get("/preview/{game_name}")
+async def preview_game(game_name: str):
+    file_path = os.path.join(BASE_DIR, f"{game_name}.html")
+    if not os.path.exists(file_path):
+        return HTMLResponse("<h2>❌ Game not found! (File missing)</h2>", status_code=404)
+    with open(file_path, "r") as f:
+        return HTMLResponse(content=f.read(), status_code=200)
 
 @app.get("/download/{apk_name}")
 async def download_apk(apk_name: str):
     return JSONResponse({
-        "message": f"✅ APK for {apk_name} generated (placeholder).",
-        "download_hint": "Real Unreal .apk build integration coming soon."
+        "message": f"✅ APK {apk_name} generated (placeholder).",
+        "note": "In future: Unreal Engine .apk export here."
     })
