@@ -5,8 +5,7 @@ import requests
 
 app = FastAPI()
 
-UNREAL_AUTOMATION_URL = "https://your-unreal-automation-endpoint.com/build"
-
+UNREAL_AUTOMATION_URL = "https://playable-36ab.onrender.com/build"
 class GameScript(BaseModel):
     game_script: str
 
