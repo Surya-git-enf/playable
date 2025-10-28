@@ -57,11 +57,13 @@ async def build_game(data: ScriptInput):
     GAMES[game_name] = html_content
 
     # Generate links
-    base_url = "https://playable-36ab.onrender.com"
-return JSONResponse({
-    "webgl_url": f"{base_url}/preview/{game_name}",
-    "apk_url": f"{base_url}/download/{game_name}.apk"
-})
+    webgl_url = f"/preview/{game_name}"
+    apk_url = f"/download/{game_name}.apk"
+
+    return JSONResponse({
+        "webgl_url": webgl_url,
+        "apk_url": apk_url
+    })
 
 @app.get("/preview/{name}")
 async def preview_game(name: str):
