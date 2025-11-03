@@ -1,9 +1,8 @@
 fastapi
-uvicorn
-gspread
-google-auth
-google-auth-oauthlib
-google-auth-httplib2
-google-generativeai
-feedparser
+uvicorn[standard]
 requests
+beautifulsoup4
+feedparser
+google-generativeai
+supabase
+python-dotenv    # optional if you use .env locally
