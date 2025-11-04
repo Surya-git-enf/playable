@@ -1,24 +1,27 @@
 # main.py
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from datetime import datetime, timedelta
-import os, csv, io, traceback, requests
+from datetime import datetime, timedelta, timezone
+import os, csv, io, traceback, requests, re
 from bs4 import BeautifulSoup
 import google.generativeai as genai
+from dateutil import parser as date_parser
 
-app = FastAPI(title="Nova — Google Sheets only summarizer")
+app = FastAPI(title="Nova — Sheets-only summarizer (robust date + fallback)")
 
 # ----------------------------
-# Environment-configured values (set these on Render)
+# Environment-configured values
 # ----------------------------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
 if not GEMINI_API_KEY:
-    raise RuntimeError("Please set GEMINI_API_KEY in Render environment variables.")
+    raise RuntimeError("Please set GEMINI_API_KEY in environment variables on Render.")
 
 SHEET_ID = os.getenv("SHEET_ID", "").strip()   # required
 SHEET_GID = os.getenv("SHEET_GID", "0").strip()
-
+# Number of days to consider "recent" (default 2). If no recent match, code will fallback to all rows.
+DAYS_LIMIT = int(os.getenv("DAYS_LIMIT", "2"))
 MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
+
 # ----------------------------
 # Init Gemini
 # ----------------------------
@@ -47,7 +50,6 @@ def fetch_sheet_rows(sheet_id: str, gid: str = "0"):
         reader = csv.DictReader(io.StringIO(s))
         rows = []
         for row in reader:
-            # normalize keys to lowercase to be forgiving
             normalized = { (k or "").strip().lower(): (v or "").strip() for k, v in row.items() }
             rows.append(normalized)
         return rows
@@ -57,32 +59,107 @@ def fetch_sheet_rows(sheet_id: str, gid: str = "0"):
         return []
 
 # ----------------------------
-# Find recent (<=days_limit) sheet row matching topic
-# Expected sheet columns (any order): headline, news, categories, link, image_url, date (YYYY-MM-DD)
+# Parse dates robustly (handles ISO with timezone)
+# ----------------------------
+def parse_date_safe(date_str: str):
+    if not date_str:
+        return None
+    try:
+        dt = date_parser.parse(date_str)
+        # Normalize to UTC date
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc).date()
+    except Exception:
+        # Try simple YYYY-MM-DD
+        try:
+            return datetime.strptime(date_str.split("T")[0], "%Y-%m-%d").date()
+        except Exception:
+            return None
+
+# ----------------------------
+# Find recent sheet news (strict recent filter)
 # ----------------------------
 def find_recent_sheet_news(topic: str, rows, days_limit: int = 2):
     topic_l = (topic or "").lower().strip()
-    today = datetime.utcnow().date()
+    today_utc = datetime.utcnow().date()
     for r in rows:
-        date_str = r.get("date") or r.get("published") or ""
+        date_str = r.get("date") or r.get("published") or r.get("pubdate") or ""
+        d = parse_date_safe(date_str)
+        if not d:
+            continue
+        # within days_limit
         try:
-            d = datetime.strptime(date_str.strip(), "%Y-%m-%d").date() if date_str else None
+            if (today_utc - d).days <= days_limit:
+                # check matches in headline/categories/news/link/image_url
+                combined = " ".join([
+                    r.get("headline",""),
+                    r.get("categories","") or r.get("category",""),
+                    r.get("news",""),
+                    r.get("link",""),
+                    r.get("image_url","") or r.get("image","")
+                ]).lower()
+                if topic_l and topic_l in combined:
+                    return {
+                        "headline": r.get("headline",""),
+                        "news": r.get("news",""),
+                        "link": r.get("link",""),
+                        "image_url": r.get("image_url","") or r.get("image",""),
+                        "date": date_str
+                    }
         except Exception:
-            d = None
-        if d and (today - d).days <= days_limit:
-            headline = r.get("headline", "") or ""
-            categories = r.get("categories", r.get("category", "")) or ""
-            if (topic_l and (topic_l in headline.lower() or topic_l in categories.lower())):
-                return {
-                    "headline": headline,
-                    "news": r.get("news") or r.get("summary") or "",
-                    "link": r.get("link") or "",
-                    "image_url": r.get("image_url") or r.get("image") or ""
-                }
+            continue
     return None
 
 # ----------------------------
-# Optional: extract article text from link (only when sheet row lacks `news`)
+# Fallback: search all rows ignoring date, prefer best match
+# ----------------------------
+def find_best_match_any_date(topic: str, rows):
+    topic_l = (topic or "").lower().strip()
+    if not topic_l:
+        return None
+    # Score rows by number of occurrences of topic in key fields, prefer recent if date exists
+    best = None
+    best_score = -1
+    best_date = None
+    for r in rows:
+        combined_fields = [
+            r.get("headline",""),
+            r.get("categories","") or r.get("category",""),
+            r.get("news",""),
+            r.get("link",""),
+            r.get("image_url","") or r.get("image","")
+        ]
+        combined = " ".join([c for c in combined_fields if c]).lower()
+        score = combined.count(topic_l)
+        if score == 0:
+            # small bonus if the topic appears as substring in headline
+            if topic_l in (r.get("headline","").lower()):
+                score += 1
+        if score > 0:
+            d = parse_date_safe(r.get("date","") or r.get("published","") or "")
+            # prefer rows with both higher score and more recent date
+            date_score = 0
+            if d:
+                days_old = (datetime.utcnow().date() - d).days
+                date_score = max(0, 30 - days_old)  # prefer more recent within 30d window
+            combined_score = score * 10 + date_score
+            if combined_score > best_score:
+                best_score = combined_score
+                best = r
+                best_date = r.get("date","")
+    if best:
+        return {
+            "headline": best.get("headline",""),
+            "news": best.get("news",""),
+            "link": best.get("link",""),
+            "image_url": best.get("image_url","") or best.get("image",""),
+            "date": best_date
+        }
+    return None
+
+# ----------------------------
+# Extract article text from link (if needed)
 # ----------------------------
 def extract_article_text(url: str, max_chars: int = 8000):
     try:
@@ -91,20 +168,19 @@ def extract_article_text(url: str, max_chars: int = 8000):
         resp.raise_for_status()
         soup = BeautifulSoup(resp.text, "html.parser")
         article = soup.find("article")
-        paragraphs = []
+        texts = []
         if article:
             for p in article.find_all("p"):
                 t = p.get_text(strip=True)
                 if t:
-                    paragraphs.append(t)
+                    texts.append(t)
         else:
             for p in soup.find_all("p"):
                 t = p.get_text(strip=True)
                 if t and len(t) > 30:
-                    paragraphs.append(t)
-        content = "\n\n".join(paragraphs).strip()
+                    texts.append(t)
+        content = "\n\n".join(texts).strip()
         if not content:
-            # fallback to meta description
             desc = soup.find("meta", {"name":"description"}) or soup.find("meta", {"property":"og:description"})
             if desc and desc.get("content"):
                 content = desc.get("content")
@@ -119,14 +195,14 @@ def extract_article_text(url: str, max_chars: int = 8000):
         return None
 
 # ----------------------------
-# Gemini summarizer wrapper (safe)
+# Gemini summarizer wrapper
 # ----------------------------
 def call_gemini_summarize(article_text: str, headline: str, user_message: str):
     try:
         prompt = (
-            "You are a professional news reporter. Summarize the article below in 2-4 short paragraphs. "
-            "Then offer one tailored follow-up suggestion the user might want next (e.g., 'Would you like a shorter TL;DR?'). "
-            "Be natural and concise.\n\n"
+            "You are Nova, a helpful news reporter. Summarize the article below in 2-4 short paragraphs, "
+            "in clear, factual language. Then propose one concise follow-up action the user might want next (tailored to the article). "
+            "Keep it natural.\n\n"
             f"User request: {user_message}\n\n"
             f"Headline: {headline}\n\n"
             f"Article:\n{article_text}\n\n"
@@ -136,9 +212,8 @@ def call_gemini_summarize(article_text: str, headline: str, user_message: str):
         resp = model.generate_content(prompt, max_output_tokens=512)
         text = getattr(resp, "text", None)
         if not text:
-            # defensive: return clear error text for easier logs
-            print("Gemini returned empty. resp repr:", repr(resp))
-            return "⚠️ Sorry — Gemini returned no summary. Check API key and quota."
+            print("Gemini returned empty response:", resp)
+            return "⚠️ Sorry — Gemini returned no summary. Check your API key/quota."
         return text.strip()
     except Exception as e:
         print("Gemini call error:", e)
@@ -146,7 +221,7 @@ def call_gemini_summarize(article_text: str, headline: str, user_message: str):
         return "⚠️ Sorry — an error occurred while generating the summary."
 
 # ----------------------------
-# Main endpoint (SHEET ONLY — no RSS)
+# Main endpoint (SHEET ONLY, with fallback search)
 # ----------------------------
 @app.post("/chat")
 def chat(req: ChatReq):
@@ -155,37 +230,44 @@ def chat(req: ChatReq):
         raise HTTPException(status_code=400, detail="message required")
 
     # derive topic (strip helper words)
-    topic = message.lower().replace("latest", "").replace("news", "").strip()
+    topic = re.sub(r"\b(latest|news)\b", "", message, flags=re.I).strip()
     if not topic:
-        topic = message.lower().strip()
+        topic = message.strip()
 
-    # 1) load sheet rows (public sheet CSV)
+    # Load sheet rows
     rows = fetch_sheet_rows(SHEET_ID, SHEET_GID)
     if not rows:
-        # clearly explain in response, so user knows why
         return {"reply": "⚠️ Could not read the Google Sheet. Ensure the sheet is public (Anyone with link can view) and SHEET_ID / SHEET_GID are set in Render env."}
 
-    # 2) find recent row in sheet
-    sheet_hit = find_recent_sheet_news(topic, rows, days_limit=2)
+    # 1) Strict recent search
+    sheet_hit = find_recent_sheet_news(topic, rows, days_limit=DAYS_LIMIT)
+
+    # 2) If not found, fallback to best match in any date
     if not sheet_hit:
-        return {"reply": f"Sorry — no recent ({2} days) items found in the Google Sheet for '{topic}'. Please add the news to the sheet or try a different query."}
+        sheet_hit = find_best_match_any_date(topic, rows)
+        if sheet_hit:
+            # flag it's an older match (optional) — we just proceed
+            print("Fallback to older match:", sheet_hit.get("headline"), "date:", sheet_hit.get("date"))
+
+    if not sheet_hit:
+        return {"reply": f"Sorry — no items found in the Google Sheet for '{topic}'. Please add the news or try a different query."}
 
     headline = sheet_hit.get("headline") or topic
     article_text = sheet_hit.get("news") or ""
     link = sheet_hit.get("link") or ""
 
-    # 3) if sheet has no 'news' text but has a link, try to extract article text (still not RSS)
+    # If sheet lacks 'news' text but has a link, try to fetch it
     if not article_text and link:
         article_text = extract_article_text(link)
 
     if not article_text:
-        return {"reply": f"Found an item in the sheet ('{headline}') but it doesn't contain article text and I couldn't fetch it from the link. Please add article text to the sheet's 'news' column or include a readable link."}
+        return {"reply": f"Found a sheet row ('{headline}') but it lacks article text and I couldn't fetch the page. Please add article text to the 'news' column or provide a readable link."}
 
-    # 4) Summarize via Gemini
+    # Summarize with Gemini
     summary = call_gemini_summarize(article_text, headline, message)
-    return {"reply": summary, "headline": headline, "link": link}
+    return {"reply": summary, "headline": headline, "link": link, "date": sheet_hit.get("date")}
 
 # health
 @app.get("/")
 def root():
-    return {"status": "ok", "note": "Sheets-only summarizer running"}
+    return {"status": "ok", "note": f"DaysLimit={DAYS_LIMIT}"}
