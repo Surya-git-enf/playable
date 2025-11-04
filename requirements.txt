@@ -1,8 +1,6 @@
 fastapi
-uvicorn[standard]
+uvicorn
 requests
-beautifulsoup4
-feedparser
 google-generativeai
 supabase
-python-dotenv    # optional if you use .env locally
+python-dateutil
