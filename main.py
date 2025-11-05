@@ -250,8 +250,12 @@ def extract_article_text(url: str, max_chars: int = 15000):
         traceback.print_exc()
         return None
 
-# ---------- Gemini summarizer ----------
 def summarize_article(article_text: str, headline: str, user_message: str):
+    """
+    Robust wrapper to call Gemini/GenAI and return text.
+    Tries multiple SDK call patterns to handle differing installed versions.
+    Avoids passing unsupported kwargs like `max_output_tokens` directly.
+    """
     try:
         prompt = (
             "You are Nova — a friendly, concise AI news reporter.\n"
@@ -262,17 +266,63 @@ def summarize_article(article_text: str, headline: str, user_message: str):
             f"Article:\n{article_text}\n\n"
             "Summary:"
         )
-        model = genai.GenerativeModel(MODEL_NAME)
-        resp = model.generate_content(prompt, max_output_tokens=700)
-        text = getattr(resp, "text", None)
-        if not text:
-            print("Gemini returned empty response:", resp)
-            return "⚠️ Sorry — no summary available from Gemini."
-        return text.strip()
+
+        # 1) Newer google-genai / GenAI Client style
+        try:
+            if hasattr(genai, "Client"):
+                client = genai.Client()
+                # contents can be a string or list; use contents=prompt
+                resp = client.models.generate_content(model=MODEL_NAME, contents=prompt)
+                # common places to find output
+                text = getattr(resp, "text", None)
+                if not text and hasattr(resp, "output") and isinstance(resp.output, (list, tuple)) and resp.output:
+                    # some SDKs put text in resp.output[0].content
+                    text = getattr(resp.output[0], "content", None)
+                if text:
+                    return text.strip()
+        except Exception as e:
+            # don't abort — try next pattern
+            print("genai.Client() call failed:", e)
+
+        # 2) Older google.generativeai GenerativeModel(...) style
+        try:
+            if hasattr(genai, "GenerativeModel"):
+                model = genai.GenerativeModel(MODEL_NAME)
+                # try basic call without extra unsupported kwargs
+                resp = model.generate_content(prompt)
+                text = getattr(resp, "text", None)
+                if text:
+                    return text.strip()
+                # try alternate keyword name if the SDK expects it
+                try:
+                    resp = model.generate_content(contents=prompt)
+                    text = getattr(resp, "text", None)
+                    if text:
+                        return text.strip()
+                except Exception:
+                    pass
+        except Exception as e:
+            print("GenerativeModel() call failed:", e)
+
+        # 3) Fallback: genai.generate_content function (older variants)
+        try:
+            if hasattr(genai, "generate_content"):
+                resp = genai.generate_content(model=MODEL_NAME, prompt=prompt)
+                text = getattr(resp, "text", None)
+                if text:
+                    return text.strip()
+        except Exception as e:
+            print("genai.generate_content() call failed:", e)
+
+        # If none of the above produced text, return a helpful fallback message
+        print("Gemini calls returned no text — full response object logged above.")
+        return "⚠️ Sorry — Gemini did not return a usable summary (SDK mismatch or quota). I fetched the article but couldn't summarize it automatically."
+
     except Exception as e:
-        print("Gemini error:", e)
+        # final catch-all: log and return friendly error message
+        print("Gemini summarizer final error:", e)
         traceback.print_exc()
-        return f"⚠️ Sorry — error while generating summary: {e}"
+        return "⚠️ Sorry — error while generating summary: Gemini unavailable or SDK mismatch. See server logs."
 
 # ---------- local conversation persistence ----------
 def save_local_conversation(email: str, conv_name: str, sender: str, text: str, meta: dict | None = None):
