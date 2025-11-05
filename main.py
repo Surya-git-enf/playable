@@ -1,6 +1,13 @@
-main_nova_updated.py
 
-from fastapi import FastAPI, HTTPException from pydantic import BaseModel from datetime import datetime, timedelta, timezone import os, json, csv, io, traceback, requests, re from bs4 import BeautifulSoup import feedparser import google.generativeai as genai from dateutil import parser as dateparser
+
+from fastapi import FastAPI, HTTPException
+from pydantic import BaseModel
+from datetime import datetime, timedelta, timezone 
+import os, json, csv, io, traceback, requests, re
+from bs4 import BeautifulSoup 
+import feedparser 
+import google.generativeai as genai
+from dateutil import parser as dateparser
 
 optional supabase (if not installed, code runs without persistent history)
 
