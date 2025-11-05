@@ -1,23 +1,13 @@
 # main.py
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from datetime import datetime, timezone
-import os
-import json
-import csv
-import io
-import traceback
-import requests
-import re
+from datetime import datetime, timedelta, timezone
+import os, json, csv, io, traceback, requests, re
 from bs4 import BeautifulSoup
 import feedparser
-# google generative ai is optional; we'll only call it if configured
-try:
-    import google.generativeai as genai
-except Exception:
-    genai = None
+import google.generativeai as genai
 from dateutil import parser as dateparser
-from typing import Optional, List, Dict
+from typing import Optional, Any
 
 # optional supabase (if not installed, code runs without persistent history)
 try:
@@ -25,57 +15,41 @@ try:
 except Exception:
     create_client = None
 
-app = FastAPI(title="Nova — Global News Summarizer (Sheets + RSS + (optional) Gemini)")
+app = FastAPI(title="Nova — Global News Summarizer (Sheets + RSS + Gemini)")
 
 @app.get("/")
 def start():
-    return {"message": "hi i am Nova , how can I help you?"}
+    return {"message": "hi i am Nova , how can I help you? 🗞️"}
 
-# -------------------------
+# ---
 # CONFIG via ENV (Render)
-# -------------------------
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "").strip()    # optional now
+# ---
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")            # required
 MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
-SHEET_ID = os.getenv("SHEET_ID", "").strip()               # optional (public sheet CSV)
+SHEET_ID = os.getenv("SHEET_ID", "").strip()           # optional (public sheet CSV)
 SHEET_GID = os.getenv("SHEET_GID", "0").strip()
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()       # optional
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()       # optional
+SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()   # optional
+SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()   # optional
 MAX_RESULTS = int(os.getenv("MAX_RESULTS", "3"))
-DAYS_LIMIT = int(os.getenv("DAYS_LIMIT", "2"))             # recent preference
-EXTRA_RSS = os.getenv("RSS_FEEDS", "").strip()             # Comma-separated extra feeds
+DAYS_LIMIT = int(os.getenv("DAYS_LIMIT", "2"))         # recent preference
+EXTRA_RSS = os.getenv("RSS_FEEDS", "").strip()
 
-# Configure Gemini only if key present and library loaded
-USE_GEMINI = False
-if GEMINI_API_KEY and genai is not None:
-    try:
-        genai.configure(api_key=GEMINI_API_KEY)
-        USE_GEMINI = True
-        print("Gemini configured.")
-    except Exception as e:
-        print("Failed to configure Gemini:", e)
-        USE_GEMINI = False
-else:
-    if not GEMINI_API_KEY:
-        print("GEMINI_API_KEY not set — running without Gemini summarizer.")
-    else:
-        print("google.generativeai library not available — running without Gemini summarizer.")
+if not GEMINI_API_KEY:
+    raise RuntimeError("Please set GEMINI_API_KEY in Render environment variables.")
+
+# Initialize Gemini
+genai.configure(api_key=GEMINI_API_KEY)
 
 # Initialize Supabase client if provided
 supabase = None
 if SUPABASE_URL and SUPABASE_KEY and create_client is not None:
     try:
         supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-        print("Supabase configured.")
     except Exception as e:
         print("Supabase init error:", e)
         supabase = None
-else:
-    if SUPABASE_URL or SUPABASE_KEY:
-        print("Supabase information provided but supabase library not available or incomplete; running without persistent DB.")
 
-# -------------------------
 # Default major global RSS feeds (expandable)
-# -------------------------
 DEFAULT_RSS_FEEDS = [
     # global general
     "http://feeds.bbci.co.uk/news/rss.xml",
@@ -102,7 +76,6 @@ DEFAULT_RSS_FEEDS = [
 # merge extras
 RSS_FEEDS = DEFAULT_RSS_FEEDS[:]
 if EXTRA_RSS:
-    # accept comma-separated list
     RSS_FEEDS = EXTRA_RSS.split(",") + RSS_FEEDS
 
 # quick keyword -> category hints (can be extended)
@@ -112,6 +85,8 @@ KEYWORD_CATEGORY = {
     "spacex": "space",
     "jwst": "space",
     "comet": "space",
+    "moon": "space",
+    "red moon": "space",
     "ai": "tech",
     "google": "tech",
     "apple": "tech",
@@ -122,26 +97,20 @@ KEYWORD_CATEGORY = {
     "football": "sports",
 }
 
-# -------------------------
 # Request model
-# -------------------------
 class ChatReq(BaseModel):
     message: str
     user_email: Optional[str] = None
     prefer_recent: Optional[bool] = True
 
-# -------------------------
 # In-memory conversation store (fallback if Supabase not configured)
-# -------------------------
-conversations: Dict[str, Dict] = {}
+conversations: dict = {}
 
-# -------------------------
-# Helpers: Sheets CSV fetch (public sheet)
-# -------------------------
-def sheet_csv_url(sheet_id: str, gid: str = "0") -> str:
+# -------- Helpers: Sheets CSV fetch (public sheet) -----------
+def sheet_csv_url(sheet_id: str, gid: str = "0"):
     return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
 
-def fetch_sheet_rows(sheet_id: str, gid: str = "0") -> List[Dict]:
+def fetch_sheet_rows(sheet_id: str, gid: str = "0"):
     if not sheet_id:
         return []
     try:
@@ -152,7 +121,7 @@ def fetch_sheet_rows(sheet_id: str, gid: str = "0") -> List[Dict]:
         reader = csv.DictReader(io.StringIO(text))
         rows = []
         for row in reader:
-            normalized = {(k or "").strip().lower(): (v or "").strip() for k, v in row.items()}
+            normalized = { (k or "").strip().lower(): (v or "").strip() for k, v in row.items() }
             rows.append(normalized)
         return rows
     except Exception as e:
@@ -160,9 +129,7 @@ def fetch_sheet_rows(sheet_id: str, gid: str = "0") -> List[Dict]:
         traceback.print_exc()
         return []
 
-# -------------------------
-# Date parse helper
-# -------------------------
+# -------- Date parse helper -----------
 def parse_date_safe(date_str: str):
     if not date_str:
         return None
@@ -173,85 +140,84 @@ def parse_date_safe(date_str: str):
         return dt.astimezone(timezone.utc)
     except Exception:
         try:
-            # fallback to date-only parse
             return datetime.strptime(date_str.split("T")[0], "%Y-%m-%d").replace(tzinfo=timezone.utc)
         except Exception:
             return None
 
-# -------------------------
-# Search Google Sheet rows for topic
-# -------------------------
-def search_sheet_for_topic(topic: str, rows: List[Dict], prefer_recent: bool = True) -> List[Dict]:
-    topic_l = (topic or "").lower().strip()
+# -------- Search Google Sheet rows for topic -----------
+def search_sheet_for_topic(topic: str, rows, prefer_recent=True):
+    topic_l = topic.lower().strip()
     today = datetime.utcnow().date()
     recent_matches = []
     any_matches = []
     for r in rows:
         combined = " ".join([
-            r.get("headline", ""),
-            r.get("news", ""),
-            r.get("categories", ""),
-            r.get("link", ""),
-            r.get("image_url", ""),
+            r.get("headline",""),
+            r.get("news",""),
+            r.get("categories",""),
+            r.get("link",""),
+            r.get("image_url",""),
         ]).lower()
         if topic_l in combined:
             any_matches.append(r)
-            d = parse_date_safe(r.get("date", "") or r.get("published", "") or "")
-            if d and (today - d.date()).days <= DAYS_LIMIT:
-                recent_matches.append(r)
+        d = parse_date_safe(r.get("date","") or r.get("published","") or "")
+        if d and (today - d.date()).days <= DAYS_LIMIT and topic_l in combined:
+            recent_matches.append(r)
     if prefer_recent and recent_matches:
         return recent_matches
     return any_matches
 
-# -------------------------
-# RSS search by category / feeds
-# -------------------------
-def map_keyword_to_category(topic: str) -> Optional[str]:
+# -------- RSS search by category / feeds -----------
+def map_keyword_to_category(topic: str):
     for k, cat in KEYWORD_CATEGORY.items():
-        if k in (topic or "").lower():
+        if k in topic.lower():
             return cat
-    for cat in ["space", "tech", "business", "world", "sports"]:
-        if cat in (topic or "").lower():
+    for cat in ["space","tech","business","world","sports"]:
+        if cat in topic.lower():
             return cat
     return None
 
-def search_rss_for_topic(topic: str, max_items: int = 20) -> List[Dict]:
-    topic_l = (topic or "").lower().strip()
+def search_rss_for_topic(topic: str, max_items=20):
+    topic_l = topic.lower().strip()
     found = []
-    cat = map_keyword_to_category(topic)
-    feeds_to_check = []
+    try:
+        # mapping to category first for prioritized feeds
+        cat = map_keyword_to_category(topic)
+        feeds_to_check = []
+        if cat:
+            # search feeds that likely match category first
+            for url in RSS_FEEDS:
+                if cat in url or any(word in url for word in [cat, "space", "tech", "reuters", "nasa", "space.com"]):
+                    feeds_to_check.append(url)
+            # then include all
+            feeds_to_check += [u for u in RSS_FEEDS if u not in feeds_to_check]
+        else:
+            feeds_to_check = RSS_FEEDS
 
-    if cat:
-        for url in RSS_FEEDS:
-            if cat in url or any(word in url for word in [cat, "space", "tech", "reuters", "nasa", "space.com"]):
-                feeds_to_check.append(url)
-        feeds_to_check += [u for u in RSS_FEEDS if u not in feeds_to_check]
-    else:
-        feeds_to_check = RSS_FEEDS
-
-    for feed_url in feeds_to_check:
-        try:
-            feed = feedparser.parse(feed_url)
-            for entry in feed.entries[:max_items]:
-                title = (entry.get("title") or "").lower()
-                summary = (entry.get("summary") or "").lower()
-                link = entry.get("link")
-                tags = ""
-                try:
-                    if entry.get("tags"):
-                        tags = " ".join([t.get("term", "") for t in entry.get("tags", [])])
-                except Exception:
+        for feed_url in feeds_to_check:
+            try:
+                feed = feedparser.parse(feed_url)
+                for entry in feed.entries[:max_items]:
+                    title = (entry.get("title") or "").lower()
+                    summary = (entry.get("summary") or "").lower()
+                    link = entry.get("link")
                     tags = ""
-                if topic_l in title or topic_l in summary or topic_l in tags.lower():
-                    found.append({
-                        "headline": entry.get("title"),
-                        "link": link,
-                        "summary": entry.get("summary", ""),
-                        "published": entry.get("published") or entry.get("updated") or None,
-                        "source_feed": feed_url
-                    })
-        except Exception as e:
-            print("RSS parse error for", feed_url, e)
+                    try:
+                        tags = " ".join([t.get("term","") for t in entry.get("tags",[])]) if entry.get("tags") else ""
+                    except Exception:
+                        tags = ""
+                    if topic_l in title or topic_l in summary or topic_l in tags:
+                        found.append({
+                            "headline": entry.get("title"),
+                            "link": link,
+                            "summary": entry.get("summary",""),
+                            "published": entry.get("published") or entry.get("updated") or None,
+                            "source_feed": feed_url
+                        })
+            except Exception as e:
+                print("RSS parse error for", feed_url, e)
+    except Exception as e:
+        print("search_rss_for_topic error:", e)
     # sort by published date if present
     def score_item(it):
         try:
@@ -261,10 +227,8 @@ def search_rss_for_topic(topic: str, max_items: int = 20) -> List[Dict]:
     found.sort(key=score_item, reverse=True)
     return found
 
-# -------------------------
-# HTML article extractor (best-effort)
-# -------------------------
-def extract_article_text(url: str, max_chars: int = 15000) -> Optional[str]:
+# -------- HTML article extractor (best-effort) -----------
+def extract_article_text(url: str, max_chars: int = 15000):
     if not url:
         return None
     try:
@@ -272,6 +236,8 @@ def extract_article_text(url: str, max_chars: int = 15000) -> Optional[str]:
         r = requests.get(url, timeout=12, headers=headers)
         r.raise_for_status()
         soup = BeautifulSoup(r.text, "html.parser")
+
+        # prefer <article>, otherwise long <p> tags
         article = soup.find("article")
         texts = []
         if article:
@@ -286,7 +252,8 @@ def extract_article_text(url: str, max_chars: int = 15000) -> Optional[str]:
                     texts.append(t)
         content = "\n\n".join(texts).strip()
         if not content:
-            meta = soup.find("meta", {"name": "description"}) or soup.find("meta", {"property": "og:description"})
+            # fallback to meta
+            meta = soup.find("meta", {"name":"description"}) or soup.find("meta", {"property":"og:description"})
             if meta and meta.get("content"):
                 content = meta.get("content")
         if not content:
@@ -299,83 +266,68 @@ def extract_article_text(url: str, max_chars: int = 15000) -> Optional[str]:
         traceback.print_exc()
         return None
 
-# -------------------------
-# Summarizer: Gemini if available, else fallback snippet
-# -------------------------
-def summarize_article(article_text: str, headline: str, user_message: str) -> str:
-    article_text = article_text or ""
-    headline = headline or ""
-    user_message = user_message or ""
-    # If Gemini is configured, try to use it
-    if USE_GEMINI and genai is not None:
-        try:
-            prompt = (
-                "You are Nova — a friendly, concise AI news reporter.\n"
-                "Summarize the article below in 2-4 short paragraphs with clear facts. "
-                "Then produce one short tailored follow-up question the user might want next (1 sentence).\n\n"
-                f"User message: {user_message}\n\n"
-                f"Headline: {headline}\n\n"
-                f"Article:\n{article_text}\n\n"
-                "Summary:"
-            )
-            model = genai.GenerativeModel(MODEL_NAME)
-            resp = model.generate_content(prompt, max_output_tokens=700)
-            # resp may have .text or may be more complex depending on library version
-            text = getattr(resp, "text", None) or (resp.get("candidates")[0].get("content") if isinstance(resp, dict) and resp.get("candidates") else None)
-            if text:
-                return text.strip()
-            else:
-                print("Gemini returned no text; falling back to snippet.")
-        except Exception as e:
-            print("Gemini error:", e)
-            traceback.print_exc()
-    # Fallback: provide a short snippet + friendly line
-    snippet = article_text.strip()[:800]
-    if len(article_text) > 800:
-        # try to end on sentence
-        try:
-            snippet = snippet.rsplit(".", 1)[0] + "."
-        except Exception:
-            pass
-    fallback = f"(Summary fallback) {snippet}\n\nWould you like more detail or the full article link?"
-    return fallback
+# -------- Gemini summarizer - returns summary + short follow-up question -----------
+def summarize_article(article_text: str, headline: str, user_message: str):
+    try:
+        prompt = (
+            "You are Nova — a friendly, concise AI news reporter.\n"
+            "Summarize the article below in 2-4 short paragraphs with clear facts. "
+            "Then produce one short tailored follow-up question the user might want next (1 sentence).\n\n"
+            f"User message: {user_message}\n\n"
+            f"Headline: {headline}\n\n"
+            f"Article:\n{article_text}\n\n"
+            "Summary:"
+        )
+        model = genai.GenerativeModel(MODEL_NAME)
+        resp = model.generate_content(prompt, max_output_tokens=700)
+        text = getattr(resp, "text", None)
+        if not text:
+            print("Gemini returned empty response:", resp)
+            return "⚠️ Sorry — no summary available from Gemini."
+        return text.strip()
+    except Exception as e:
+        print("Gemini error:", e)
+        traceback.print_exc()
+        return f"⚠️ Sorry — error while generating summary: {e}"
 
-# -------------------------
-# Conversation persistence (local + supabase)
-# -------------------------
-def save_local_conversation(email: str, conv_name: str, sender: str, text: str, meta: Optional[Dict] = None):
+# -------- Conversation persistence helpers -----------
+def save_local_conversation(email: str, conv_name: str, sender: str, text: str, meta: Optional[dict] = None):
     if not email:
         return
     if email not in conversations:
         conversations[email] = {"last_conv": conv_name, "convs": {conv_name: []}}
     if conv_name not in conversations[email]["convs"]:
         conversations[email]["convs"][conv_name] = []
-    conversations[email]["convs"][conv_name].append({"sender": sender, "text": text, "ts": datetime.utcnow().isoformat() + "Z", "meta": meta or {}})
+    conversations[email]["convs"][conv_name].append({"sender": sender, "text": text, "ts": datetime.utcnow().isoformat()+"Z", "meta": meta or {}})
     conversations[email]["last_conv"] = conv_name
 
-def save_supabase_conversation(email: str, conv_name: str, sender: str, text: str, meta: Optional[Dict] = None) -> bool:
+def save_supabase_conversation(email: str, conv_name: str, sender: str, text: str, meta: Optional[dict] = None):
     if not supabase:
         return False
     try:
-        # ensure user row exists (best-effort)
+        # fetch existing user row
         res = supabase.table("users").select("email, chat_history").eq("email", email).execute()
         data = getattr(res, "data", None) or (res.get("data") if isinstance(res, dict) else None)
         if not data:
-            supabase.table("users").insert({"email": email, "chat_history": {}}).execute()
+            # insert user with empty chat_history
+            supabase.table("users").insert({"email": email, "chat_history": []}).execute()
+
         # fetch current
         r2 = supabase.table("users").select("chat_history").eq("email", email).single().execute()
-        r2data = getattr(r2, "data", None) or (r2.get("data") if isinstance(r2, dict) else None)
-        hist = (r2data.get("chat_history") if r2data else {}) or {}
-        if isinstance(hist, str):
-            try:
-                hist = json.loads(hist)
-            except Exception:
-                hist = {}
-        if not isinstance(hist, dict):
-            hist = {}
-        if conv_name not in hist:
-            hist[conv_name] = []
-        hist[conv_name].append({"sender": sender, "text": text, "ts": datetime.utcnow().isoformat() + "Z", "meta": meta or {}})
+        hist = (getattr(r2, "data", None) or r2.get("data") if isinstance(r2, dict) else {}).get("chat_history", []) or []
+        # Normalize hist to list-of-items format
+        if isinstance(hist, dict):
+            # convert dict into list entries
+            hist_list = []
+            for k, v in hist.items():
+                hist_list.append({k: v})
+            hist = hist_list
+        if not isinstance(hist, list):
+            hist = []
+
+        # append or update
+        new_entry = {conv_name: {sender: text, "meta": meta or {}, "ts": datetime.utcnow().isoformat()+"Z"}}
+        hist.append(new_entry)
         supabase.table("users").update({"chat_history": hist}).eq("email", email).execute()
         return True
     except Exception as e:
@@ -383,293 +335,341 @@ def save_supabase_conversation(email: str, conv_name: str, sender: str, text: st
         traceback.print_exc()
         return False
 
-# -------------------------
-# Read user preferences from chat_history (last N user messages)
-# -------------------------
-COMMON_TOPICS = [
-    "moon", "red moon", "nasa", "space", "black hole", "blackhole", "spacex", "jwst",
-    "moon eclipse", "eclipse", "cricket", "football", "ai", "google", "apple"
-]
-
-def get_user_preferences_from_history(email: Optional[str], limit_messages: int = 5) -> List[str]:
-    if not email:
-        return []
-    messages = []
-    hist = {}
-    if supabase:
+# -------- Parse last N chat_history items from supabase user row (best-effort) -----------
+def fetch_last_chat_history_topics(email: str, limit: int = 5):
+    """
+    Returns a list of text snippets (user messages + Nova replies) from last `limit` history items.
+    Handles a few shapes of chat_history JSON stored in Supabase.
+    """
+    snippets = []
+    if not supabase or not email:
+        # fallback to local memory
         try:
-            r = supabase.table("users").select("chat_history").eq("email", email).single().execute()
-            data = getattr(r, "data", None) or (r.get("data") if isinstance(r, dict) else None)
-            hist = (data.get("chat_history") if data else {}) or {}
-            if isinstance(hist, str):
-                try:
-                    hist = json.loads(hist)
-                except Exception:
-                    hist = {}
-        except Exception:
-            hist = {}
-    else:
-        hist = conversations.get(email, {}).get("convs", {}) if email in conversations else {}
-
-    items = []
-    if isinstance(hist, dict):
-        for conv, msgs in hist.items():
-            if isinstance(msgs, list):
+            convs = conversations.get(email, {}).get("convs", {})
+            # flatten last messages across last conv
+            last_conv = conversations.get(email, {}).get("last_conv")
+            if last_conv:
+                msgs = convs.get(last_conv, [])[-limit:]
                 for m in msgs:
-                    ts = m.get("ts")
-                    items.append((ts, m))
+                    snippets.append(m.get("text") or "")
+            return snippets
+        except Exception:
+            return snippets
+
     try:
-        items.sort(key=lambda x: x[0] or "", reverse=True)
-    except Exception:
-        pass
-
-    for _, m in items:
-        sender = (m.get("sender") or "").lower()
-        if sender and sender not in {"nova", "system"}:
-            messages.append(m.get("text") or "")
-        if len(messages) >= limit_messages:
-            break
-
-    prefs = []
-    for msg in messages:
-        t = (msg or "").lower()
-        for ct in COMMON_TOPICS:
-            if ct in t and ct not in prefs:
-                prefs.append(ct)
-        for k in KEYWORD_CATEGORY.keys():
-            if k in t and k not in prefs:
-                prefs.append(k)
-        # fallback tokens
-        tokens = re.findall(r"\b[a-z]{3,20}\b", t)
-        for tk in tokens:
-            if tk not in prefs and len(prefs) < 5:
-                prefs.append(tk)
-    cleaned = []
-    for p in prefs:
-        p_clean = p.strip()
-        if p_clean and p_clean not in cleaned:
-            cleaned.append(p_clean)
-    return cleaned[:5]
-
-# -------------------------
-# Follow-up detection
-# -------------------------
-def is_affirmative_reply(text: str) -> bool:
-    t = (text or "").strip().lower()
-    return t in {"yes", "y", "yeah", "yep", "sure", "absolutely", "ok", "okay", "please", "tell me more", "more", "continue"}
-
-# -------------------------
-# Debug endpoint (no Gemini) - inspect what sheet/RSS returns
-# -------------------------
-@app.post("/chat_debug")
-def chat_debug(req: ChatReq):
-    try:
-        print("DEBUG: /chat_debug received:", req.dict())
-        email = (req.user_email or "").strip().lower() or None
-        topic = (req.message or "").strip()
-        if not topic:
-            return {"error": "message required", "received": req.dict()}
-        sheet_rows = fetch_sheet_rows(SHEET_ID, SHEET_GID) if SHEET_ID else []
-        sheet_matches = []
-        if sheet_rows:
-            sheet_matches = search_sheet_for_topic(topic, sheet_rows, prefer_recent=bool(req.prefer_recent))
-        rss_found = search_rss_for_topic(topic, max_items=10)
-        return {
-            "received": req.dict(),
-            "sheet_matches_count": len(sheet_matches),
-            "sheet_sample": sheet_matches[:3],
-            "rss_found_count": len(rss_found),
-            "rss_sample": rss_found[:3],
-        }
+        r = supabase.table("users").select("chat_history").eq("email", email).single().execute()
+        data = getattr(r, "data", None) or (r.get("data") if isinstance(r, dict) else None)
+        hist = data.get("chat_history", []) if data else []
+        # Several possible shapes:
+        # 1) list of entries like [{ "conv1": {"user":"...","Nova":"..."} }, ...]
+        # 2) dict of conv_name->list or dict
+        # 3) simple list of messages strings
+        if isinstance(hist, dict):
+            # convert to list of {conv: {...}}
+            hist_list = []
+            for k, v in hist.items():
+                hist_list.append({k: v})
+            hist = hist_list
+        if isinstance(hist, list):
+            # reverse iterate last entries
+            for item in reversed(hist[-limit:]):
+                if isinstance(item, dict):
+                    # take inner values
+                    for conv_name, conv_val in item.items():
+                        if isinstance(conv_val, dict):
+                            # collect user and Nova text if keys exist
+                            if "user" in conv_val:
+                                snippets.append(conv_val.get("user",""))
+                            # Nova could be under "Nova" or stored as messages
+                            if "Nova" in conv_val:
+                                snippets.append(conv_val.get("Nova",""))
+                            # if conv_val itself is list of messages
+                            if isinstance(conv_val, list):
+                                for inner in conv_val[-3:]:
+                                    if isinstance(inner, dict):
+                                        snippets.append(inner.get("text",""))
+                        elif isinstance(conv_val, list):
+                            for m in conv_val[-3:]:
+                                if isinstance(m, dict):
+                                    snippets.append(m.get("text",""))
+                        else:
+                            # fallback: stringify
+                            snippets.append(str(conv_val))
+                else:
+                    snippets.append(str(item))
+        else:
+            # fallback: stringify
+            snippets.append(str(hist))
+        # trim and clean
+        snippets = [s for s in snippets if s and len(s.strip())>0][:limit]
+        return snippets
     except Exception as e:
-        print("ERROR in /chat_debug:", e)
+        print("fetch_last_chat_history_topics error:", e)
         traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+        return snippets
 
-# -------------------------
-# Main chat endpoint (robust - always returns fallback if summarizer fails)
-# -------------------------
+# -------- Simple keyword extractor from snippets -----------
+def extract_priorities_from_history(snippets):
+    """
+    Given text snippets from previous chats, produce a prioritized list of keywords/topics.
+    We'll be conservative: look for known KEYWORD_CATEGORY keys, nouns like 'moon', 'nasa', etc.
+    """
+    priorities = []
+    joined = " ".join(snippets).lower()
+    # check known keywords first
+    for k in KEYWORD_CATEGORY.keys():
+        if k in joined and k not in priorities:
+            priorities.append(k)
+    # some simple heuristics for single words
+    extras = ["moon", "eclipse", "red moon", "supermoon", "launch", "jwst", "black hole", "mars", "nasa", "spacex"]
+    for e in extras:
+        if e in joined and e not in priorities:
+            priorities.append(e)
+    # fallback: take top words (naive)
+    if not priorities:
+        words = re.findall(r"\b[a-z]{3,20}\b", joined)
+        freq = {}
+        for w in words:
+            freq[w] = freq.get(w,0)+1
+        common = sorted(freq.items(), key=lambda x: x[1], reverse=True)[:5]
+        for w,_ in common:
+            if w not in priorities and len(priorities) < 5:
+                priorities.append(w)
+    return priorities
+
+# -------- Follow-up detection -----------
+def is_affirmative_reply(text: str):
+    t = text.strip().lower()
+    return t in {"yes","y","yeah","yep","sure","absolutely","ok","okay","please","tell me more","more","continue"}
+
+# -------- Main chat endpoint -----------
 @app.post("/chat")
 def chat(req: ChatReq):
-    try:
-        user_message = (req.message or "").strip()
-        if not user_message:
-            raise HTTPException(status_code=400, detail="message required")
-        email = (req.user_email or "").strip().lower() or None
-        prefer_recent = True if req.prefer_recent is None else bool(req.prefer_recent)
+    user_message = (req.message or "").strip()
+    if not user_message:
+        raise HTTPException(status_code=400, detail="message required")
+    email = (req.user_email or "").strip().lower() or None
+    prefer_recent = True if req.prefer_recent is None else bool(req.prefer_recent)
 
-        topic = re.sub(r"\b(latest|news|give me|show me|tell me|what's|is there|any)\b", "", user_message, flags=re.I).strip()
-        if not topic:
-            topic = user_message
+    # Clean a little (remove assistant invocation word variants)
+    topic = re.sub(r"\b(nova|nova,|nova:|latest|news|give me|show me|tell me|what's|is there)\b", "", user_message, flags=re.I).strip()
+    if not topic:
+        topic = user_message.strip()
 
-        # Check if user replied 'yes' to continue previous article
-        if email and is_affirmative_reply(user_message) and ((email in conversations and conversations[email].get("last_conv")) or supabase):
-            last_conv = conversations.get(email, {}).get("last_conv") if email in conversations else None
-            if not last_conv and supabase and email:
-                try:
-                    r = supabase.table("users").select("chat_history").eq("email", email).single().execute()
-                    data = getattr(r, "data", None) or (r.get("data") if isinstance(r, dict) else None)
-                    hist = data.get("chat_history", {}) if data else {}
-                    if hist:
-                        last_conv = list(hist.keys())[-1]
-                except Exception:
-                    last_conv = None
-            if last_conv:
-                # find last link from local conv or supabase
-                msgs = conversations.get(email, {}).get("convs", {}).get(last_conv, []) if email in conversations else []
-                last_link = None
-                headline = None
-                for m in reversed(msgs):
-                    meta = m.get("meta") or {}
-                    if meta.get("link"):
-                        last_link = meta.get("link")
-                        headline = meta.get("headline")
-                        break
-                if not last_link and supabase and email:
-                    try:
-                        r = supabase.table("users").select("chat_history").eq("email", email).single().execute()
-                        data = getattr(r, "data", None) or (r.get("data") if isinstance(r, dict) else None)
-                        hist = data.get("chat_history", {}) if data else {}
-                        conv_msgs = hist.get(last_conv, [])
-                        for m in reversed(conv_msgs):
-                            if m.get("meta", {}).get("link"):
-                                last_link = m["meta"]["link"]
-                                headline = m["meta"].get("headline")
+    # If user is answering follow-up "yes", try to continue last conversation / last link
+    if email and is_affirmative_reply(user_message) and ((email in conversations and conversations[email].get("last_conv")) or supabase):
+        # try to find last conv and last saved link
+        last_conv = conversations.get(email, {}).get("last_conv") if email in conversations else None
+        if not last_conv and supabase and email:
+            try:
+                r = supabase.table("users").select("chat_history").eq("email", email).single().execute()
+                data = getattr(r, "data", None) or r.get("data") if isinstance(r, dict) else None
+                hist = data.get("chat_history", {}) if data else {}
+                if hist:
+                    # try to pick last conv name
+                    if isinstance(hist, dict):
+                        last_conv = list(hist.keys())[-1] if hist else None
+                    elif isinstance(hist, list) and len(hist) > 0:
+                        # last element may be {convname: {...}}
+                        last_conv = list(hist[-1].keys())[0] if isinstance(hist[-1], dict) else None
+            except Exception:
+                last_conv = None
+
+        last_link = None
+        headline = None
+        # scan local convs
+        if email in conversations and last_conv:
+            msgs = conversations[email].get("convs", {}).get(last_conv, [])
+            for m in reversed(msgs):
+                meta = m.get("meta") or {}
+                if meta.get("link"):
+                    last_link = meta.get("link")
+                    headline = meta.get("headline")
+                    break
+        # supabase fallback
+        if not last_link and supabase and email:
+            try:
+                r = supabase.table("users").select("chat_history").eq("email", email).single().execute()
+                data = getattr(r, "data", None) or r.get("data") if isinstance(r, dict) else None
+                hist = data.get("chat_history", {}) if data else {}
+                # find last link in history items
+                if isinstance(hist, list):
+                    for item in reversed(hist):
+                        if isinstance(item, dict):
+                            for conv_name, conv_val in item.items():
+                                if isinstance(conv_val, dict):
+                                    # may contain meta
+                                    mlink = conv_val.get("meta", {}).get("link")
+                                    if mlink:
+                                        last_link = mlink
+                                        headline = conv_val.get("meta", {}).get("headline")
+                                        break
+                                elif isinstance(conv_val, list):
+                                    for msg in reversed(conv_val):
+                                        if isinstance(msg, dict) and msg.get("meta", {}).get("link"):
+                                            last_link = msg["meta"]["link"]
+                                            headline = msg["meta"].get("headline")
+                                            break
+                        if last_link:
+                            break
+                elif isinstance(hist, dict):
+                    # dict of convs
+                    for conv_name, conv_val in hist.items():
+                        if isinstance(conv_val, list):
+                            for msg in reversed(conv_val):
+                                if isinstance(msg, dict) and msg.get("meta", {}).get("link"):
+                                    last_link = msg["meta"]["link"]
+                                    headline = msg["meta"].get("headline")
+                                    break
+                            if last_link:
                                 break
-                    except Exception:
-                        pass
-                if not last_link:
-                    return {"reply": "I couldn't find the previous article link to continue. Send a direct link or ask about a topic."}
-                article_text = extract_article_text(last_link)
-                if not article_text:
-                    return {"reply": f"Couldn't fetch more details from {last_link}. Here's the link: {last_link}"}
-                deeper_prompt = (
-                    "You are Nova — now give a richer, deeper explanation about the article, "
-                    "covering context, significance, and comparisons (if applicable). Keep it clear and factual."
-                )
-                combined_text = deeper_prompt + "\n\n" + article_text
-                deep_summary = summarize_article(combined_text, headline or topic, user_message)
-                if email:
-                    save_local_conversation(email, last_conv, "nova", deep_summary, meta={"link": last_link, "headline": headline})
-                    if supabase:
-                        save_supabase_conversation(email, last_conv, "nova", deep_summary, meta={"link": last_link, "headline": headline})
-                return {"reply": deep_summary, "link": last_link}
+            except Exception:
+                pass
 
-        # New behavior: consult user's chat history for topic preferences
-        prefs = get_user_preferences_from_history(email) if email else []
-        ordered_topics: List[str] = []
-        for p in prefs:
-            if p not in ordered_topics:
-                ordered_topics.append(p)
-        if topic and topic not in ordered_topics:
-            ordered_topics.append(topic)
-        if not ordered_topics:
-            ordered_topics = [topic]
+        if not last_link:
+            return {"reply": "I couldn't find the previous article link to continue. Send a direct link or ask about a topic (for example: 'latest NASA launches')."}
+        article_text = extract_article_text(last_link)
+        if not article_text:
+            return {"reply": f"Couldn't fetch more details from {last_link}. Here's the link: {last_link}"}
+        # deeper summary (longer)
+        deeper_prompt = (
+            "You are Nova — now give a richer, deeper explanation about the article, "
+            "covering context, significance, and comparisons (if applicable). Keep it clear and factual."
+        )
+        combined_text = deeper_prompt + "\n\n" + article_text
+        deep_summary = summarize_article(combined_text, headline or topic, user_message)
+        # save
+        conv_name = last_conv or f"conv_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}"
+        if email:
+            save_local_conversation(email, conv_name, "nova", deep_summary, meta={"link": last_link, "headline": headline})
+            if supabase:
+                save_supabase_conversation(email, conv_name, "nova", deep_summary, meta={"link": last_link, "headline": headline})
+        return {"reply": deep_summary, "link": last_link}
 
-        # 1) Try Google Sheet first (prioritize preferences)
-        sheet_rows = fetch_sheet_rows(SHEET_ID, SHEET_GID) if SHEET_ID else []
-        articles: List[Dict] = []
+    # MAIN flow: use chat history to bias search results
+    # 1) Fetch last chat snippets (if any)
+    snippets = fetch_last_chat_history_topics(email, limit=5) if email else []
+    priorities = extract_priorities_from_history(snippets) if snippets else []
+    # Put user typed topic first
+    search_topics = []
+    if topic:
+        search_topics.append(topic)
+    # Add priorities next (dedupe)
+    for p in priorities:
+        if p not in search_topics:
+            search_topics.append(p)
+    # fallback small default topic if none
+    if not search_topics:
+        search_topics = [topic or "news"]
 
-        for t in ordered_topics:
-            if len(articles) >= MAX_RESULTS:
-                break
-            if sheet_rows:
-                matches = search_sheet_for_topic(t, sheet_rows, prefer_recent=prefer_recent)
-                for r in matches:
-                    if len(articles) >= MAX_RESULTS:
-                        break
-                    headline = r.get("headline") or r.get("title") or t
-                    link = r.get("link") or ""
-                    article_text = r.get("news") or r.get("summary") or ""
-                    published = r.get("date") or None
-                    if link and not article_text:
-                        article_text = extract_article_text(link)
-                    articles.append({"headline": headline, "link": link, "article_text": article_text, "published": published, "source": "sheet", "matched_topic": t})
+    # Try Google Sheet first
+    sheet_rows = fetch_sheet_rows(SHEET_ID, SHEET_GID) if SHEET_ID else []
+    articles = []
 
-        # 2) If not enough, search RSS prioritized by ordered_topics
-        if len(articles) < MAX_RESULTS:
-            for t in ordered_topics:
+    # helper to add article while avoiding duplicates
+    def add_article_if_new(art):
+        for a in articles:
+            if a.get("link") and art.get("link") and a.get("link") == art.get("link"):
+                return False
+        articles.append(art)
+        return True
+
+    # search through prioritized topics
+    for t in search_topics:
+        if len(articles) >= MAX_RESULTS:
+            break
+        if sheet_rows:
+            sheet_matches = search_sheet_for_topic(t, sheet_rows, prefer_recent=prefer_recent)
+            for r in sheet_matches:
                 if len(articles) >= MAX_RESULTS:
                     break
-                rss_found = search_rss_for_topic(t, max_items=20)
-                for item in rss_found:
-                    if len(articles) >= MAX_RESULTS:
-                        break
-                    link = item.get("link")
-                    headline = item.get("headline") or t
-                    article_text = extract_article_text(link) or item.get("summary") or ""
-                    articles.append({"headline": headline, "link": link, "article_text": article_text, "published": item.get("published"), "source": "rss", "matched_topic": t})
+                headline = r.get("headline") or r.get("title") or t
+                link = r.get("link") or ""
+                article_text = r.get("news") or r.get("summary") or ""
+                published = r.get("date") or None
+                if link and not article_text:
+                    article_text = extract_article_text(link)
+                art = {"headline": headline, "link": link, "article_text": article_text, "published": published, "source": "sheet"}
+                add_article_if_new(art)
 
-        if not articles:
-            friendly = ("I couldn't find articles for your request in the sheet or RSS feeds. "
-                        "Try a different query or provide a link. "
-                        f"I searched based on your recent chats: {', '.join(prefs)}") if prefs else "I couldn't find articles for your request in the sheet or RSS feeds. Try a different query or provide a link."
-            return {"reply": friendly}
+    # then RSS search for any remaining slots
+    if len(articles) < MAX_RESULTS:
+        for t in search_topics:
+            if len(articles) >= MAX_RESULTS:
+                break
+            rss_found = search_rss_for_topic(t, max_items=20)
+            for item in rss_found:
+                if len(articles) >= MAX_RESULTS:
+                    break
+                link = item.get("link")
+                headline = item.get("headline") or t
+                article_text = extract_article_text(link) or item.get("summary") or ""
+                art = {"headline": headline, "link": link, "article_text": article_text, "published": item.get("published"), "source": "rss"}
+                add_article_if_new(art)
 
-        # Summarize articles
-        summaries = []
-        for art in articles[:MAX_RESULTS]:
-            art_text = art.get("article_text") or ""
-            if not art_text:
-                summaries.append({
-                    "headline": art.get("headline"),
-                    "link": art.get("link"),
-                    "summary": f"❗️ No extractable text found at {art.get('link')}.",
-                    "source": art.get("source"),
-                    "matched_topic": art.get("matched_topic")
-                })
-                continue
-            summary_text = summarize_article(art_text, art.get("headline", topic), user_message)
-            # ensure fallback if summarizer gives odd values
-            if not summary_text or str(summary_text).strip().lower() in {"", "none", "null"}:
-                snippet = art_text[:800]
-                try:
-                    snippet = snippet.rsplit(".", 1)[0] + "."
-                except Exception:
-                    pass
-                summary_text = f"(Fallback) {snippet}"
+    # If no articles found, be chatty and helpful
+    if not articles:
+        hint = ""
+        if snippets:
+            hint = f" I checked your recent preferences like: {', '.join(snippets[:3])}. "
+        return {
+            "reply": f"Sorry — I couldn't find articles for '{topic}'.{hint}Try a different query (e.g., 'latest NASA launches', 'red moon eclipse') or paste a link and I'll summarize it for you.",
+            "count": 0
+        }
+
+    # Summarize articles with Gemini
+    summaries = []
+    for art in articles[:MAX_RESULTS]:
+        if not art.get("article_text"):
             summaries.append({
                 "headline": art.get("headline"),
                 "link": art.get("link"),
-                "summary": summary_text,
+                "summary": f"❗️ No extractable text found at {art.get('link')}.",
                 "source": art.get("source"),
-                "published": art.get("published"),
-                "matched_topic": art.get("matched_topic")
+                "published": art.get("published")
             })
+            continue
+        summary_text = summarize_article(art["article_text"], art.get("headline", topic), user_message)
+        summaries.append({
+            "headline": art.get("headline"),
+            "link": art.get("link"),
+            "summary": summary_text,
+            "source": art.get("source"),
+            "published": art.get("published")
+        })
 
-        # Compose reply
-        lead = "Hey — based on your request and recent chat history, here's what I found:\n\n"
-        blocks = []
-        for i, s in enumerate(summaries, start=1):
-            topic_note = f" (matched: {s.get('matched_topic')})" if s.get('matched_topic') else ""
-            block = f"{i}. {s.get('headline')}{topic_note}\n\n{s.get('summary')}\n\nLink: {s.get('link')}"
-            blocks.append(block)
-        combined_reply = lead + "\n\n---\n\n".join(blocks)
+    # Compose numbered human-friendly reply (chatty)
+    blocks = []
+    for i, s in enumerate(summaries, start=1):
+        pub = f" (published: {s.get('published')})" if s.get('published') else ""
+        block = f"{i}. {s.get('headline')}{pub}\n\n{s.get('summary')}\n\n🔗 {s.get('link')}"
+        blocks.append(block)
+    combined_reply = "\n\n---\n\n".join(blocks)
 
-        # Save conversation (local + supabase)
-        conv_name = topic or f"conv_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}"
-        if email:
-            save_local_conversation(email, conv_name, email, user_message, meta={"topic": topic, "prefs_used": prefs})
-            save_local_conversation(email, conv_name, "nova", combined_reply, meta={"results": len(summaries)})
-            if supabase:
-                try:
-                    save_supabase_conversation(email, conv_name, email, user_message, meta={"topic": topic, "prefs_used": prefs})
-                    save_supabase_conversation(email, conv_name, "nova", combined_reply, meta={"results": len(summaries)})
-                except Exception as e:
-                    print("supabase save failed", e)
-                    traceback.print_exc()
+    # Save conversation (local + supabase) with metadata including topic and priorities
+    conv_name = topic or f"conv_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}"
+    # Save user's message (incoming)
+    if email:
+        save_local_conversation(email, conv_name, email, user_message, meta={"topic": topic, "priorities": priorities})
+        if supabase:
+            try:
+                save_supabase_conversation(email, conv_name, email, user_message, meta={"topic": topic, "priorities": priorities})
+            except Exception as e:
+                print("supabase save failed (user msg)", e)
+    # Save Nova reply
+    if email:
+        save_local_conversation(email, conv_name, "nova", combined_reply, meta={"results": len(summaries), "priorities": priorities})
+        if supabase:
+            try:
+                save_supabase_conversation(email, conv_name, "nova", combined_reply, meta={"results": len(summaries), "priorities": priorities})
+            except Exception as e:
+                print("supabase save failed (nova reply)", e)
 
-        followup_hint = "\n\nWould you like more detail on any of these (reply 'yes' or the number)?"
-        return {"reply": combined_reply + followup_hint, "count": len(summaries), "conversation": conv_name}
-    except Exception as e:
-        print("ERROR in /chat:", e)
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail=str(e))
+    followup_hint = "\n\nWould you like more detail on any of these (reply 'yes' or the number)?"
 
-# -------------------------
-# health
-# -------------------------
-@app.get("/health")
-def health():
-    return {"status": "ok"}
-                
+    return {
+        "reply": f"Hey — here are the top {len(summaries)} results I found based on your message and recent chat history:\n\n{combined_reply}{followup_hint}",
+        "count": len(summaries),
+        "conversation": conv_name
+        }
+        
