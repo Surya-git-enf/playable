@@ -16,6 +16,9 @@ except Exception:
 
 app = FastAPI(title="Nova — Global News Summarizer (Sheets + RSS + Gemini)")
 
+@app.get("/")
+def start():
+    return {"message":"hi i am Nova , how can I help you?"}
 # -------------------------
 # CONFIG via ENV (Render)
 # -------------------------
