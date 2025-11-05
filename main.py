@@ -506,8 +506,10 @@ def chat(req: ChatReq):
     def add_matches_for_topic(t):
         nonlocal articles
         if sheet_rows:
-           sheet_matches = search_sheet_for_topic(t, sheet_rows, prefer_recent=prefer_recent)
+            
+            sheet_matches = search_sheet_for_topic(t, sheet_rows, prefer_recent=prefer_recent)
             for r in sheet_matches:
+                
                 if len(articles) >= MAX_RESULTS:
                     return
                 headline = r.get("headline") or r.get("title") or t
