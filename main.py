@@ -32,6 +32,9 @@ Base.metadata.create_all(bind=engine)
 # -----------------------------------
 app = FastAPI(title="Nova AI Chat Agent")
 
+@app.get("/")
+def home():
+    return{"message":"hlo , i am Nova how can I help you 🙏 "}
 
 # -----------------------------------
 # Pydantic models
