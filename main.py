@@ -1,4 +1,12 @@
-from fastapi import FastAPI, HTTPException from pydantic import BaseModel from datetime import datetime, timezone import os, json, csv, io, traceback, requests, re, uuid, sqlite3 from bs4 import BeautifulSoup import feedparser import google.generativeai as genai from dateutil import parser as dateparser from typing import Optional
+from fastapi import FastAPI, HTTPException 
+from pydantic import BaseModel 
+from datetime import datetime, timezone 
+import os, json, csv, io, traceback, requests, re, uuid, sqlite3 
+from bs4 import BeautifulSoup 
+import feedparser
+import google.generativeai as genai
+from dateutil import parser as dateparser
+from typing import Optional
 
 Optional supabase client if present
 
