@@ -1,631 +1,336 @@
-# main.py
-from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel
-from datetime import datetime, timezone
-import os, json, csv, io, traceback, requests, re, uuid
-from bs4 import BeautifulSoup
-import feedparser
-import google.generativeai as genai
-from dateutil import parser as dateparser
+from fastapi import FastAPI, HTTPException from pydantic import BaseModel from datetime import datetime, timezone import os, json, csv, io, traceback, requests, re, uuid, sqlite3 from bs4 import BeautifulSoup import feedparser import google.generativeai as genai from dateutil import parser as dateparser from typing import Optional
 
-# optional supabase client (if not installed code still runs)
-try:
-    from supabase import create_client
-except Exception:
-    create_client = None
+Optional supabase client if present
 
-app = FastAPI(title="Nova — Global News Summarizer (Sheets + RSS + Gemini)")
+try: from supabase import create_client except Exception: create_client = None
 
-@app.get("/")
-def root():
-    return {"message": "hi i am Nova , how can I help you?"}
+app = FastAPI(title="Nova — Friendly News + Chat Assistant")
 
-# --- config via ENV ---
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
-MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-1.5-flash")
-SHEET_ID = os.getenv("SHEET_ID", "").strip()
-SHEET_GID = os.getenv("SHEET_GID", "0").strip()
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
-MAX_RESULTS = int(os.getenv("MAX_RESULTS", "3"))
-DAYS_LIMIT = int(os.getenv("DAYS_LIMIT", "2"))
-EXTRA_RSS = os.getenv("RSS_FEEDS", "").strip()
+---------------- CONFIG ----------------
 
-if not GEMINI_API_KEY:
-    raise RuntimeError("Please set GEMINI_API_KEY in environment variables.")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY") MODEL_NAME = os.getenv("GEMINI_MODEL", "gemini-1.5-flash") SHEET_ID = os.getenv("SHEET_ID", "").strip() SHEET_GID = os.getenv("SHEET_GID", "0").strip() SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip() SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip() MAX_RESULTS = int(os.getenv("MAX_RESULTS", "3")) DAYS_LIMIT = int(os.getenv("DAYS_LIMIT", "2")) EXTRA_RSS = os.getenv("RSS_FEEDS", "").strip() SQLITE_DB = os.getenv("SQLITE_DB", "nova_cache.db")
+
+if not GEMINI_API_KEY: raise RuntimeError("Please set GEMINI_API_KEY in environment variables.")
+
+configure genai
 
 genai.configure(api_key=GEMINI_API_KEY)
 
-# init supabase client if provided
-supabase = None
-if SUPABASE_URL and SUPABASE_KEY and create_client is not None:
-    try:
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-    except Exception as e:
-        print("Supabase init error:", e)
-        supabase = None
+init supabase if provided
 
-# default RSS feeds (expand as you like)
-DEFAULT_RSS_FEEDS = [
-    "http://feeds.bbci.co.uk/news/rss.xml",
-    "http://rss.cnn.com/rss/edition.rss",
-    "https://www.theguardian.com/world/rss",
-    "https://feeds.reuters.com/reuters/topNews",
-    "https://feeds.npr.org/1001/rss.xml",
-    "https://www.nasa.gov/rss/dyn/breaking_news.rss",
-    "https://www.space.com/feeds/all",
-    "https://www.sciencedaily.com/rss/top/science.xml",
-    "https://techcrunch.com/feed/",
-    "https://www.theverge.com/rss/index.xml",
-    "https://feeds.arstechnica.com/arstechnica/index",
-    "https://feeds.a.dj.com/rss/RSSWorldNews.xml",
-    "https://feeds.reuters.com/reuters/businessNews",
-    "https://www.spacepolicyonline.com/feeds/posts/default",
-    "https://www.spaceflightnow.com/launch-feed/",
-]
+supabase = None if SUPABASE_URL and SUPABASE_KEY and create_client is not None: try: supabase = create_client(SUPABASE_URL, SUPABASE_KEY) except Exception as e: print("Supabase init error:", e) supabase = None
 
-RSS_FEEDS = DEFAULT_RSS_FEEDS[:]
-if EXTRA_RSS:
-    RSS_FEEDS = EXTRA_RSS.split(",") + RSS_FEEDS
+---------------- RSS FEEDS (expanded) ----------------
 
-KEYWORD_CATEGORY = {
-    "nasa": "space",
-    "space": "space",
-    "spacex": "space",
-    "jwst": "space",
-    "comet": "space",
-    "moon": "space",
-    "red moon": "space",
-    "ai": "tech",
-    "google": "tech",
-    "apple": "tech",
-    "markets": "business",
-    "economy": "business",
-    "covid": "world",
-    "cricket": "sports",
-    "football": "sports",
-}
+DEFAULT_RSS_FEEDS = [ # global "http://feeds.bbci.co.uk/news/rss.xml", "http://rss.cnn.com/rss/edition.rss", "https://www.theguardian.com/world/rss", "https://feeds.reuters.com/reuters/topNews", "https://feeds.npr.org/1001/rss.xml", # tech "https://techcrunch.com/feed/", "https://www.theverge.com/rss/index.xml", "https://feeds.arstechnica.com/arstechnica/index", # business "https://feeds.a.dj.com/rss/RSSWorldNews.xml", "https://feeds.reuters.com/reuters/businessNews", # space / science "https://www.nasa.gov/rss/dyn/breaking_news.rss", "https://www.space.com/feeds/all", "https://www.sciencedaily.com/rss/top/science.xml", # entertainment / streaming "https://www.hollywoodreporter.com/feed/", "https://www.variety.com/rss2.0.xml", "https://www.rollingstone.com/music/music-news/feed/", "https://www.empireonline.com/feeds/all/rss/", # Netflix specific and entertainment news "https://about.netflix.com/en/newsroom/rss", "https://www.netflix.com/browse/genre/rss", # culture / tv "https://www.vulture.com/rss/index.xml", "https://ew.com/tv/feed/", # sports "https://www.espn.com/espn/rss/news", # regional "https://timesofindia.indiatimes.com/rssfeedstopstories.cms", "https://www.aljazeera.com/xml/rss/all.xml", # space policy / launches "https://www.spacepolicyonline.com/feeds/posts/default", "https://www.spaceflightnow.com/launch-feed/", ]
 
-# --- request models ---
-class ChatReq(BaseModel):
-    message: str
-    user_email: str | None = None
-    prefer_recent: bool | None = True
+category -> extra feeds map (priority)
 
-class GetChatReq(BaseModel):
-    user_email: str
-    conversation_name: str
+CATEGORY_FEEDS = { "space": [ "https://www.nasa.gov/rss/dyn/breaking_news.rss", "https://www.space.com/feeds/all", "https://www.spaceflightnow.com/launch-feed/", ], "tech": [ "https://techcrunch.com/feed/", "https://www.theverge.com/rss/index.xml", "https://feeds.arstechnica.com/arstechnica/index", ], "business": [ "https://feeds.a.dj.com/rss/RSSWorldNews.xml", "https://feeds.reuters.com/reuters/businessNews", ], "entertainment": [ "https://www.hollywoodreporter.com/feed/", "https://www.variety.com/rss2.0.xml", "https://www.rollingstone.com/music/music-news/feed/", "https://www.empireonline.com/feeds/all/rss/", "https://about.netflix.com/en/newsroom/rss", "https://www.vulture.com/rss/index.xml", "https://ew.com/tv/feed/", ], "sports": [ "https://www.espn.com/espn/rss/news", ], "world": [ "http://feeds.bbci.co.uk/news/rss.xml", "https://www.theguardian.com/world/rss", "https://www.aljazeera.com/xml/rss/all.xml", ] }
 
-# in-memory fallback conversation store
-# structure: conversations[email]["convs"][conv_name] = [ {"sender":..,"text":..,"ts":..,"meta":{}} ...]
-conversations = {}
+RSS_FEEDS = (EXTRA_RSS.split(",") if EXTRA_RSS else []) + DEFAULT_RSS_FEEDS
 
-# ---------- Helpers: sheets ----------
-def sheet_csv_url(sheet_id: str, gid: str = "0"):
-    return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+quick keyword -> category
 
-def fetch_sheet_rows(sheet_id: str, gid: str = "0"):
-    if not sheet_id:
-        return []
-    try:
-        url = sheet_csv_url(sheet_id, gid)
-        r = requests.get(url, timeout=12)
-        r.raise_for_status()
-        text = r.content.decode("utf-8")
-        reader = csv.DictReader(io.StringIO(text))
-        rows = []
-        for row in reader:
-            normalized = { (k or "").strip().lower(): (v or "").strip() for k, v in row.items() }
-            rows.append(normalized)
-        return rows
-    except Exception as e:
-        print("Sheet fetch error:", e)
-        traceback.print_exc()
-        return []
+KEYWORD_CATEGORY = { "nasa": "space", "space": "space", "spacex": "space", "jwst": "space", "comet": "space", "moon": "space", "red moon": "space", "ai": "tech", "google": "tech", "apple": "tech", "markets": "business", "economy": "business", "covid": "world", "cricket": "sports", "football": "sports", "netflix": "entertainment", "stranger things": "entertainment", "strangerthings": "entertainment", }
 
-# ---------- date helper ----------
-def parse_date_safe(date_str: str):
-    if not date_str:
-        return None
-    try:
-        dt = dateparser.parse(date_str)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except Exception:
+---------------- MODELS / INPUT ----------------
+
+class ChatReq(BaseModel): message: str user_email: Optional[str] = None prefer_recent: Optional[bool] = True
+
+class GetChatReq(BaseModel): user_email: str conversation_name: str
+
+class AppendReq(BaseModel): user_email: str conversation_name: str sender: str text: str
+
+---------------- SIMPLE SQLITE DB ----------------
+
+def init_db(): conn = sqlite3.connect(SQLITE_DB, check_same_thread=False) cur = conn.cursor() cur.execute("""CREATE TABLE IF NOT EXISTS users ( email TEXT PRIMARY KEY, chat_history TEXT DEFAULT '[]', created_at TEXT )""") conn.commit() return conn
+
+DB = init_db()
+
+def get_user_row_sqlite(email: str): cur = DB.cursor() cur.execute("SELECT email, chat_history FROM users WHERE email = ?", (email,)) row = cur.fetchone() if not row: return None return {"email": row[0], "chat_history": json.loads(row[1] or "[]")}
+
+def ensure_user_row_sqlite(email: str): if not email: return False if get_user_row_sqlite(email) is not None: return True cur = DB.cursor() cur.execute("INSERT INTO users (email, chat_history, created_at) VALUES (?, ?, ?)", (email, "[]", datetime.utcnow().isoformat()+"Z")) DB.commit() return True
+
+def fetch_sqlite_chat_history(email: str): row = get_user_row_sqlite(email) if not row: return [] return row.get("chat_history", []) or []
+
+def save_sqlite_chat_history_append(email: str, conv_obj): ensure_user_row_sqlite(email) hist = fetch_sqlite_chat_history(email) or [] hist.append(conv_obj) cur = DB.cursor() cur.execute("UPDATE users SET chat_history = ? WHERE email = ?", (json.dumps(hist), email)) DB.commit() return True
+
+def update_sqlite_conversation(email: str, conv_name: str, add_pairs: dict): ensure_user_row_sqlite(email) hist = fetch_sqlite_chat_history(email) or [] found = False for i, obj in enumerate(hist): if isinstance(obj, dict) and conv_name in obj: existing = obj.get(conv_name) or {} merged = existing.copy() merged.update(add_pairs) hist[i] = {conv_name: merged} found = True break if not found: hist.append({conv_name: add_pairs}) cur = DB.cursor() cur.execute("UPDATE users SET chat_history = ? WHERE email = ?", (json.dumps(hist), email)) DB.commit() return True
+
+---------------- UTILITIES ----------------
+
+def sheet_csv_url(sheet_id: str, gid: str = "0"): return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
+
+def fetch_sheet_rows(sheet_id: str, gid: str = "0"): if not sheet_id: return [] try: url = sheet_csv_url(sheet_id, gid) r = requests.get(url, timeout=12) r.raise_for_status() text = r.content.decode("utf-8") reader = csv.DictReader(io.StringIO(text)) rows = [] for row in reader: normalized = { (k or "").strip().lower(): (v or "").strip() for k, v in row.items() } rows.append(normalized) return rows except Exception as e: print("Sheet fetch error:", e) traceback.print_exc() return []
+
+def parse_date_safe(date_str: str): if not date_str: return None try: dt = dateparser.parse(date_str) if dt.tzinfo is None: dt = dt.replace(tzinfo=timezone.utc) return dt.astimezone(timezone.utc) except Exception: try: return datetime.strptime(date_str.split("T")[0], "%Y-%m-%d").replace(tzinfo=timezone.utc) except Exception: return None
+
+def map_keyword_to_category(topic: str): for k, cat in KEYWORD_CATEGORY.items(): if k in topic.lower(): return cat for cat in ["space","tech","business","world","sports","entertainment"]: if cat in topic.lower(): return cat return None
+
+def search_rss_for_topic(topic: str, max_items=30, category: Optional[str]=None): topic_l = topic.lower().strip() found = [] try: # build prioritized feed list: category-specific first, then global list feeds_to_check = [] if category and category in CATEGORY_FEEDS: feeds_to_check += CATEGORY_FEEDS[category] # add all feeds but avoid duplicates for u in RSS_FEEDS: if u not in feeds_to_check: feeds_to_check.append(u)
+
+for feed_url in feeds_to_check:
         try:
-            return datetime.strptime(date_str.split("T")[0], "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        except Exception:
-            return None
-
-# ---------- sheet search ----------
-def search_sheet_for_topic(topic: str, rows, prefer_recent=True):
-    topic_l = topic.lower().strip()
-    today = datetime.utcnow().date()
-    recent_matches = []
-    any_matches = []
-    for r in rows:
-        combined = " ".join([
-            r.get("headline",""),
-            r.get("news",""),
-            r.get("categories",""),
-            r.get("link",""),
-            r.get("image_url",""),
-        ]).lower()
-        if topic_l in combined:
-            any_matches.append(r)
-        d = parse_date_safe(r.get("date","") or r.get("published","") or "")
-        if d and (today - d.date()).days <= DAYS_LIMIT:
-            recent_matches.append(r)
-    if prefer_recent and recent_matches:
-        return recent_matches
-    return any_matches
-
-# ---------- rss search ----------
-def map_keyword_to_category(topic: str):
-    for k, cat in KEYWORD_CATEGORY.items():
-        if k in topic.lower():
-            return cat
-    for cat in ["space","tech","business","world","sports"]:
-        if cat in topic.lower():
-            return cat
-    return None
-
-def search_rss_for_topic(topic: str, max_items=20):
-    topic_l = topic.lower().strip()
-    found = []
-    try:
-        cat = map_keyword_to_category(topic)
-        feeds_to_check = []
-        if cat:
-            for url in RSS_FEEDS:
-                if cat in url or any(word in url for word in [cat, "space", "tech", "reuters", "nasa", "space.com"]):
-                    feeds_to_check.append(url)
-            feeds_to_check += [u for u in RSS_FEEDS if u not in feeds_to_check]
-        else:
-            feeds_to_check = RSS_FEEDS
-
-        for feed_url in feeds_to_check:
-            try:
-                feed = feedparser.parse(feed_url)
-                for entry in feed.entries[:max_items]:
-                    title = (entry.get("title") or "").lower()
-                    summary = (entry.get("summary") or "").lower()
-                    link = entry.get("link")
-                    tags = " ".join([t.get('term','') for t in entry.get('tags', [])]) if entry.get('tags') else ""
-                    if topic_l in title or topic_l in summary or topic_l in tags.lower():
-                        found.append({
-                            "headline": entry.get("title"),
-                            "link": link,
-                            "summary": entry.get("summary", ""),
-                            "published": entry.get("published") or entry.get("updated") or None,
-                            "source_feed": feed_url
-                        })
-            except Exception as e:
-                print("RSS parse error for", feed_url, e)
-    except Exception as e:
-        print("search_rss_for_topic error", e)
-
-    def score_item(it):
-        try:
-            return dateparser.parse(it.get("published")) if it.get("published") else datetime.min
-        except Exception:
-            return datetime.min
-    found.sort(key=score_item, reverse=True)
-    return found
-
-# ---------- article extraction ----------
-def extract_article_text(url: str, max_chars: int = 15000):
-    if not url:
-        return None
-    try:
-        headers = {"User-Agent": "Mozilla/5.0 (compatible; NovaBot/1.0)"}
-        r = requests.get(url, timeout=12, headers=headers)
-        r.raise_for_status()
-        soup = BeautifulSoup(r.text, "html.parser")
-        article = soup.find("article")
-        texts = []
-        if article:
-            for p in article.find_all("p"):
-                t = p.get_text(strip=True)
-                if t:
-                    texts.append(t)
-        else:
-            for p in soup.find_all("p"):
-                t = p.get_text(strip=True)
-                if t and len(t) > 40:
-                    texts.append(t)
-        content = "\n\n".join(texts).strip()
-        if not content:
-            meta = soup.find("meta", {"name":"description"}) or soup.find("meta", {"property":"og:description"})
-            if meta and meta.get("content"):
-                content = meta.get("content")
-        if not content:
-            return None
-        if len(content) > max_chars:
-            content = content[:max_chars].rsplit(".", 1)[0] + "."
-        return content
-    except Exception as e:
-        print("Article extraction error:", e)
-        traceback.print_exc()
-        return None
-
-def summarize_article(article_text: str, headline: str, user_message: str):
-    """
-    Robust wrapper to call Gemini/GenAI and return text.
-    Tries multiple SDK call patterns to handle differing installed versions.
-    Avoids passing unsupported kwargs like `max_output_tokens` directly.
-    """
-    try:
-        prompt = (
-            "You are Nova — a friendly, concise AI news reporter.\n"
-            "Summarize the article below in 2-4 short paragraphs with clear facts. "
-            "Then produce one short tailored follow-up question the user might want next (1 sentence).\n\n"
-            f"User message: {user_message}\n\n"
-            f"Headline: {headline}\n\n"
-            f"Article:\n{article_text}\n\n"
-            "Summary:"
-        )
-
-        # 1) Newer google-genai / GenAI Client style
-        try:
-            if hasattr(genai, "Client"):
-                client = genai.Client()
-                # contents can be a string or list; use contents=prompt
-                resp = client.models.generate_content(model=MODEL_NAME, contents=prompt)
-                # common places to find output
-                text = getattr(resp, "text", None)
-                if not text and hasattr(resp, "output") and isinstance(resp.output, (list, tuple)) and resp.output:
-                    # some SDKs put text in resp.output[0].content
-                    text = getattr(resp.output[0], "content", None)
-                if text:
-                    return text.strip()
+            feed = feedparser.parse(feed_url)
+            for entry in feed.entries[:max_items]:
+                title = (entry.get("title") or "").lower()
+                summary = (entry.get("summary") or "").lower()
+                link = entry.get("link")
+                tags = " ".join([t.get('term','') for t in entry.get('tags', [])]) if entry.get('tags') else ""
+                if topic_l in title or topic_l in summary or topic_l in tags.lower():
+                    found.append({
+                        "headline": entry.get("title"),
+                        "link": link,
+                        "summary": entry.get("summary", ""),
+                        "published": entry.get("published") or entry.get("updated") or None,
+                        "source_feed": feed_url
+                    })
         except Exception as e:
-            # don't abort — try next pattern
-            print("genai.Client() call failed:", e)
+            # don't crash if one feed is bad
+            print("RSS parse error for", feed_url, e)
+except Exception as e:
+    print("search_rss_for_topic error", e)
 
-        # 2) Older google.generativeai GenerativeModel(...) style
-        try:
-            if hasattr(genai, "GenerativeModel"):
-                model = genai.GenerativeModel(MODEL_NAME)
-                # try basic call without extra unsupported kwargs
-                resp = model.generate_content(prompt)
-                text = getattr(resp, "text", None)
-                if text:
-                    return text.strip()
-                # try alternate keyword name if the SDK expects it
+def score_item(it):
+    try:
+        return dateparser.parse(it.get("published")) if it.get("published") else datetime.min
+    except Exception:
+        return datetime.min
+found.sort(key=score_item, reverse=True)
+return found
+
+def extract_article_text(url: str, max_chars: int = 15000): if not url: return None try: headers = {"User-Agent": "Mozilla/5.0 (compatible; NovaBot/1.0)"} r = requests.get(url, timeout=12, headers=headers) r.raise_for_status() soup = BeautifulSoup(r.text, "html.parser") article = soup.find("article") texts = [] if article: for p in article.find_all("p"): t = p.get_text(strip=True) if t: texts.append(t) else: for p in soup.find_all("p"): t = p.get_text(strip=True) if t and len(t) > 40: texts.append(t) content = "
+
+".join(texts).strip() if not content: meta = soup.find("meta", {"name":"description"}) or soup.find("meta", {"property":"og:description"}) if meta and meta.get("content"): content = meta.get("content") if not content: return None if len(content) > max_chars: content = content[:max_chars].rsplit(".", 1)[0] + "." return content except Exception as e: print("Article extraction error:", e) traceback.print_exc() return None
+
+---------------- Gemini robust summarizer (no unsupported kwargs) ----------------
+
+def summarize_article(article_text: str, headline: str, user_message: str): try: prompt = ( "You are Nova — a friendly, concise AI news reporter. " "Summarize the article below in 2-4 short paragraphs with clear facts. " "Then produce one short tailored follow-up question the user might want next (1 sentence).
+
+" f"User message: {user_message}
+
+" f"Headline: {headline}
+
+" f"Article: {article_text}
+
+" "Summary:" )
+
+# 1) try Client() style
+    try:
+        if hasattr(genai, "Client"):
+            client = genai.Client()
+            resp = client.models.generate_content(model=MODEL_NAME, contents=prompt)
+            text = getattr(resp, "text", None)
+            if not text and hasattr(resp, "output") and isinstance(resp.output, (list, tuple)) and resp.output:
+                text = getattr(resp.output[0], "content", None) or getattr(resp.output[0], "text", None)
+            if text:
+                return text.strip()
+    except Exception as e:
+        print("genai.Client() call failed:", e)
+
+    # 2) older GenerativeModel style
+    try:
+        if hasattr(genai, "GenerativeModel"):
+            model = genai.GenerativeModel(MODEL_NAME)
+            for call_args in ( (prompt,), {"prompt": prompt}, {"contents": prompt} ):
                 try:
-                    resp = model.generate_content(contents=prompt)
+                    resp = model.generate_content(*call_args) if isinstance(call_args, tuple) else model.generate_content(**call_args)
                     text = getattr(resp, "text", None)
                     if text:
                         return text.strip()
                 except Exception:
-                    pass
-        except Exception as e:
-            print("GenerativeModel() call failed:", e)
-
-        # 3) Fallback: genai.generate_content function (older variants)
-        try:
-            if hasattr(genai, "generate_content"):
-                resp = genai.generate_content(model=MODEL_NAME, prompt=prompt)
-                text = getattr(resp, "text", None)
-                if text:
-                    return text.strip()
-        except Exception as e:
-            print("genai.generate_content() call failed:", e)
-
-        # If none of the above produced text, return a helpful fallback message
-        print("Gemini calls returned no text — full response object logged above.")
-        return "⚠️ Sorry — Gemini did not return a usable summary (SDK mismatch or quota). I fetched the article but couldn't summarize it automatically."
-
-    except Exception as e:
-        # final catch-all: log and return friendly error message
-        print("Gemini summarizer final error:", e)
-        traceback.print_exc()
-        return "⚠️ Sorry — error while generating summary: Gemini unavailable or SDK mismatch. See server logs."
-
-# ---------- local conversation persistence ----------
-def save_local_conversation(email: str, conv_name: str, sender: str, text: str, meta: dict | None = None):
-    if not email:
-        return
-    if email not in conversations:
-        conversations[email] = {"last_conv": conv_name, "convs": {conv_name: []}}
-    if conv_name not in conversations[email]["convs"]:
-        conversations[email]["convs"][conv_name] = []
-    conversations[email]["convs"][conv_name].append({"sender": sender, "text": text, "ts": datetime.utcnow().isoformat()+"Z", "meta": meta or {}})
-    conversations[email]["last_conv"] = conv_name
-
-# ---------- Supabase helpers (JSONB array) ----------
-def get_user_row(email: str):
-    """Return user's row dict or None"""
-    if not supabase or not email:
-        return None
-    try:
-        res = supabase.table("users").select("email, chat_history").eq("email", email).execute()
-        data = getattr(res, "data", None) or (res.get("data") if isinstance(res, dict) else None)
-        if not data:
-            return None
-        # res.data might be a list or single object depending on client wrapper
-        if isinstance(data, list):
-            if len(data) == 0:
-                return None
-            return data[0]
-        return data
-    except Exception as e:
-        print("Supabase get_user_row error:", e)
-        return None
-
-def ensure_user_row(email: str):
-    """Ensure a user row exists; create if missing. Return True/False."""
-    if not supabase or not email:
-        return False
-    try:
-        if not get_user_row(email):
-            supabase.table("users").insert({"email": email, "chat_history": []}).execute()
-        return True
-    except Exception as e:
-        print("ensure_user_row error:", e)
-        return False
-
-def fetch_supabase_chat_history(email: str):
-    """
-    Return chat_history as Python list (JSONB array) or [].
-    Expected shape: [ { "conv_name": { ... } }, ... ]
-    """
-    row = get_user_row(email)
-    if not row:
-        return []
-    hist = row.get("chat_history", []) or []
-    # ensure list
-    if isinstance(hist, dict):
-        # convert dict to list of single item for backward compatibility
-        return [hist]
-    if not isinstance(hist, list):
-        return []
-    return hist
-
-def save_supabase_chat_history_append(email: str, conv_obj):
-    """
-    Append conv_obj (e.g. { conv_name: {user:..., 'Nova': ...} }) to chat_history array.
-    Replaces entire chat_history column with new array (supabase client handles JSON->jsonb).
-    """
-    if not supabase or not email:
-        return False
-    try:
-        ensure_user_row(email)
-        r = supabase.table("users").select("chat_history").eq("email", email).single().execute()
-        data = getattr(r, "data", None) or (r.get("data") if isinstance(r, dict) else None)
-        hist = data.get("chat_history", []) if data else []
-        if not isinstance(hist, list):
-            hist = []
-        hist.append(conv_obj)
-        supabase.table("users").update({"chat_history": hist}).eq("email", email).execute()
-        return True
-    except Exception as e:
-        print("Supabase save error:", e)
-        return False
-
-def update_supabase_conversation(email: str, conv_name: str, add_pairs: dict):
-    """
-    Update a conversation inside chat_history array by name.
-    - If conversation exists, merge append new pairs in order (user->Nova->user->Nova...).
-    - If not exists, append a new conversation object.
-    add_pairs example: {"surya@example.com": "new message", "Nova": "reply"}
-    Returns True/False.
-    """
-    if not supabase or not email:
-        return False
-    try:
-        ensure_user_row(email)
-        r = supabase.table("users").select("chat_history").eq("email", email).single().execute()
-        data = getattr(r, "data", None) or (r.get("data") if isinstance(r, dict) else None)
-        hist = data.get("chat_history", []) if data else []
-        if not isinstance(hist, list):
-            hist = []
-        # find index
-        found = False
-        for i, obj in enumerate(hist):
-            if isinstance(obj, dict) and conv_name in obj:
-                # merge by appending keys in order; keep existing as dict but preserve insertion order by creating new dict
-                existing = obj.get(conv_name, {}) or {}
-                merged = existing.copy()
-                merged.update(add_pairs)
-                hist[i] = {conv_name: merged}
-                found = True
-                break
-        if not found:
-            hist.append({conv_name: add_pairs})
-        supabase.table("users").update({"chat_history": hist}).eq("email", email).execute()
-        return True
-    except Exception as e:
-        print("update_supabase_conversation error:", e)
-        return False
-
-# ---------- utilities ----------
-def is_affirmative_reply(text: str):
-    t = text.strip().lower()
-    return t in {"yes","y","yeah","yep","sure","absolutely","ok","okay","please","tell me more","more","continue"}
-
-def parse_preferences_from_history(hist_list):
-    """
-    Return prioritized topic keywords from last N items in chat_history JSONB array.
-    hist_list expected as described above.
-    """
-    if not hist_list:
-        return []
-    topics = []
-    for item in reversed(hist_list[-5:]):
-        if not isinstance(item, dict):
-            continue
-        for conv_name, conv_body in item.items():
-            if not isinstance(conv_body, dict):
-                continue
-            for k, v in conv_body.items():
-                if k.lower() == "nova":
                     continue
-                if isinstance(v, str):
-                    text = v.lower()
-                    for kw in KEYWORD_CATEGORY.keys():
-                        if kw in text and kw not in topics:
-                            topics.append(kw)
-                    if "moon" in text and "moon" not in topics:
-                        topics.append("moon")
-            # also try conv_name text for keywords
-            for kw in KEYWORD_CATEGORY.keys():
-                if kw in conv_name.lower() and kw not in topics:
-                    topics.append(kw)
-    return topics
+    except Exception as e:
+        print("GenerativeModel() call failed:", e)
 
-# ---------- main chat endpoint ----------
-@app.post("/chat")
-def chat(req: ChatReq):
-    user_message = (req.message or "").strip()
-    if not user_message:
-        raise HTTPException(status_code=400, detail="message required")
-    email = (req.user_email or "").strip().lower() or None
-    prefer_recent = True if req.prefer_recent is None else bool(req.prefer_recent)
+    # 3) fallback: genai.generate_content function
+    try:
+        if hasattr(genai, "generate_content"):
+            resp = genai.generate_content(model=MODEL_NAME, prompt=prompt)
+            text = getattr(resp, "text", None)
+            if text:
+                return text.strip()
+    except Exception as e:
+        print("genai.generate_content() call failed:", e)
 
-    topic = re.sub(r"\b(latest|news|give me|show me|tell me|what's|any)\b", "", user_message, flags=re.I).strip()
-    if not topic:
-        topic = user_message.strip()
+    # final fallback: short extractive summary (first 2 paragraphs)
+    paragraphs = article_text.split("
 
-    # if user is answering yes to followup, attempt to continue last conv
-    if email and is_affirmative_reply(user_message) and ((email in conversations and conversations[email].get("last_conv")) or supabase):
-        last_conv = conversations.get(email, {}).get("last_conv") if email in conversations else None
-        if not last_conv and supabase:
-            # try to fetch last entry from supabase chat_history
-            hist = fetch_supabase_chat_history(email)
-            if hist:
-                last_conv = list(hist[-1].keys())[0] if isinstance(hist[-1], dict) else None
-        if last_conv:
-            # attempt to find a link in local or supabase saved meta (best-effort)
-            last_link = None
-            headline = None
-            msgs = conversations.get(email, {}).get("convs", {}).get(last_conv, []) if email in conversations else []
-            for m in reversed(msgs):
-                meta = m.get("meta") or {}
-                if meta.get("link"):
-                    last_link = meta.get("link")
-                    headline = meta.get("headline")
-                    break
-            if not last_link and supabase:
-                # look inside supabase's last conversation object for any 'meta' or 'link' keys
-                hist = fetch_supabase_chat_history(email)
-                if hist:
-                    last_obj = hist[-1] if isinstance(hist[-1], dict) else {}
-                    body = list(last_obj.values())[0] if last_obj else {}
-                    last_link = body.get("meta_link") or body.get("link")
-                    headline = body.get("headline")
-            if not last_link:
-                return {"reply": "I couldn't find the previous article link to continue. Send a direct link or ask about a topic."}
-            article_text = extract_article_text(last_link)
-            if not article_text:
-                return {"reply": f"Couldn't fetch more details from {last_link}. Here's the link: {last_link}"}
-            deeper_prompt = ("You are Nova — now give a richer, deeper explanation about the article, "
-                             "covering context, significance, and comparisons (if applicable). Keep it clear and factual.")
-            combined_text = deeper_prompt + "\n\n" + article_text
-            deep_summary = summarize_article(combined_text, headline or topic, user_message)
-            # save
-            conv_name = last_conv
-            if email:
-                save_local_conversation(email, conv_name, "nova", deep_summary, meta={"link": last_link, "headline": headline})
-                if supabase:
-                    try:
-                        update_supabase_conversation(email, conv_name, {"Nova": deep_summary})
-                    except Exception:
-                        pass
-            return {"reply": deep_summary, "link": last_link}
+") short = "
 
-    # build prioritized topics from message and history
-    history_list = fetch_supabase_chat_history(email) if email else []
-    history_topics = parse_preferences_from_history(history_list)
+".join(paragraphs[:2]).strip() fallback = (f"⚠️ Couldn't get a GenAI summary (SDK mismatch or quota). " f"Here is an extract:
 
-    prioritized = []
-    explicit = topic.lower()
-    if explicit and explicit not in ("latest", "news"):
-        prioritized.append(explicit)
-    for ht in history_topics:
-        if ht not in prioritized:
-            prioritized.append(ht)
-    if not prioritized:
-        prioritized = [topic]
+{short}
 
-    sheet_rows = fetch_sheet_rows(SHEET_ID, SHEET_GID) if SHEET_ID else []
-    articles = []
+Would you like me to try again or open the original link?") return fallback except Exception as e: print("Gemini summarizer final error:", e) traceback.print_exc() return "⚠️ Sorry — error while generating summary: Gemini unavailable or SDK mismatch."
 
-    def add_matches_for_topic(t):
-        nonlocal articles
-        if sheet_rows:
-            
-            sheet_matches = search_sheet_for_topic(t, sheet_rows, prefer_recent=prefer_recent)
-            for r in sheet_matches:
-                
-                if len(articles) >= MAX_RESULTS:
-                    return
-                headline = r.get("headline") or r.get("title") or t
-                link = r.get("link") or ""
-                article_text = r.get("news") or r.get("summary") or ""
-                published = r.get("date") or None
-                if link and not article_text:
-                    article_text = extract_article_text(link)
-                articles.append({"headline": headline, "link": link, "article_text": article_text, "published": published, "source": "sheet"})
-        if len(articles) < MAX_RESULTS:
-            rss_found = search_rss_for_topic(t, max_items=20)
-            for item in rss_found:
-                if len(articles) >= MAX_RESULTS:
-                    break
-                link = item.get("link")
-                headline = item.get("headline") or t
-                article_text = extract_article_text(link) or item.get("summary") or ""
-                articles.append({"headline": headline, "link": link, "article_text": article_text, "published": item.get("published"), "source": "rss"})
+---------------- Conversation helpers ----------------
 
-    for t in prioritized:
-        if len(articles) >= MAX_RESULTS:
-            break
-        add_matches_for_topic(t)
+def is_affirmative_reply(text: str): t = (text or "").strip().lower() return t in {"yes","y","yeah","yep","sure","absolutely","ok","okay","please","tell me more","more","continue"}
 
-    if not articles:
-        rss_found = search_rss_for_topic(topic, max_items=30)
-        for item in rss_found[:MAX_RESULTS]:
+decide if message requires news fetch or just chat
+
+NEWS_INTENT_KEYWORDS = ["news","update","updates","latest","breaking","any updates","is there any","report","reports","announce","released","release","new"] GREETINGS_RE = re.compile(r"(hi|hello|hey|hiya|greetings|glad to meet|nice to meet|pleased to meet)", re.I)
+
+def decide_need_news(user_message: str): """Return (need_news: bool, category: Optional[str], topic_text: str) Heuristics: - If greeting-only (matches GREETINGS_RE and short) => no news - If contains explicit news intent keywords => yes - If message mentions a keyword mapped to category => yes, use that category - Otherwise default to chat (no news) but offer to search if user asks """ msg = (user_message or "").strip() if not msg: return False, None, "" # if short greeting and likely not asking anything if len(msg) < 60 and GREETINGS_RE.search(msg) and not any(k in msg.lower() for k in NEWS_INTENT_KEYWORDS): return False, None, msg low = msg.lower() # if explicit news intent for k in NEWS_INTENT_KEYWORDS: if k in low: cat = map_keyword_to_category(low) return True, cat, msg # if mentions known keyword (e.g., 'stranger things') cat = map_keyword_to_category(low) if cat: return True, cat, msg # otherwise, default to chat return False, None, msg
+
+---------------- MAIN /chat endpoint ----------------
+
+@app.post("/chat") def chat(req: ChatReq): user_message = (req.message or "").strip() if not user_message: raise HTTPException(status_code=400, detail="message required") email = (req.user_email or "").strip().lower() or None prefer_recent = True if req.prefer_recent is None else bool(req.prefer_recent)
+
+need_news, category, topic = decide_need_news(user_message)
+
+# fetch history for personalization (sqlite primary, supabase fallback)
+history_list = fetch_sqlite_chat_history(email) if email else []
+if not history_list and supabase and email:
+    try:
+        r = supabase.table("users").select("chat_history").eq("email", email).single().execute()
+        data = getattr(r, "data", None) or (r.get("data") if isinstance(r, dict) else None)
+        hist = data.get("chat_history", []) if data else []
+        if isinstance(hist, list):
+            history_list = hist
+    except Exception:
+        pass
+
+# If no news needed -> chatbot reply (use Gemini only for conversational replies if desired)
+if not need_news:
+    reply = None
+    # simple conversational handling: if user says 'help' or asks for suggestions, we respond
+    low = user_message.lower()
+    if any(g in low for g in ("help","suggest","what can you do","how can you")):
+        reply = ("Hey 👋 I'm Nova — your friendly news buddy and assistant. I can:
+
+" "• fetch the latest news on topics you ask about " "• summarize articles " "• store and show past conversations " "• suggest related topics and alerts
+
+" "Ask me something or say 'news about <topic>' to get started! 🚀") else: # default friendly echo + suggestion reply = f"Hey 👋 nice to meet you! I heard: "{user_message}". What's on your mind — want news, suggestions, or a quick chat?"
+
+# save conversation stub
+    if email:
+        conv_name = f"chat_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:6]}"
+        save_sqlite_chat_history_append(email, {conv_name: {email: user_message, "Nova": reply}})
+        if supabase:
+            try:
+                supabase.table("users").upsert({"email": email, "chat_history": fetch_sqlite_chat_history(email)}).execute()
+            except Exception:
+                pass
+    return {"reply": reply, "conversation": conv_name if email else None}
+
+# need_news == True: proceed to fetch news using category-aware feeds
+# build prioritized topic and feeds
+topic_text = topic
+cat = category
+
+# try sheet first
+sheet_rows = fetch_sheet_rows(SHEET_ID, SHEET_GID) if SHEET_ID else []
+articles = []
+
+def add_matches_for_topic(t, cat=None):
+    nonlocal articles
+    # sheet
+    if sheet_rows:
+        sheet_matches = search_sheet_for_topic(t, sheet_rows, prefer_recent=prefer_recent)
+        for r in sheet_matches:
+            if len(articles) >= MAX_RESULTS:
+                return
+            headline = r.get("headline") or r.get("title") or t
+            link = r.get("link") or ""
+            article_text = r.get("news") or r.get("summary") or ""
+            published = r.get("date") or None
+            if link and not article_text:
+                article_text = extract_article_text(link)
+            articles.append({"headline": headline, "link": link, "article_text": article_text, "published": published, "source": "sheet"})
+    # rss (category prioritized)
+    if len(articles) < MAX_RESULTS:
+        rss_found = search_rss_for_topic(t, max_items=30, category=cat)
+        for item in rss_found:
+            if len(articles) >= MAX_RESULTS:
+                break
             link = item.get("link")
-            headline = item.get("headline") or topic
+            headline = item.get("headline") or t
             article_text = extract_article_text(link) or item.get("summary") or ""
             articles.append({"headline": headline, "link": link, "article_text": article_text, "published": item.get("published"), "source": "rss"})
 
-    if not articles:
-        return {"reply": f"Sorry — I couldn't find articles for '{topic}' in the sheet or RSS feeds. Try a different query or provide a link."}
+add_matches_for_topic(topic_text, cat)
 
-    summaries = []
-    for art in articles[:MAX_RESULTS]:
-        if not art.get("article_text"):
-            summaries.append({"headline": art.get("headline"), "link": art.get("link"), "summary": f"❗️ No extractable text found at {art.get('link')}.", "source": art.get("source")})
+# fallback: broad google news RSS search
+if not articles:
+    try:
+        q = requests.utils.quote(topic_text)
+        gurl = f"https://news.google.com/rss/search?q={q}"
+        feed = feedparser.parse(gurl)
+        for entry in feed.entries[:MAX_RESULTS]:
+            headline = entry.get("title")
+            link = entry.get("link")
+            article_text = extract_article_text(link) or entry.get("summary") or ""
+            articles.append({"headline": headline, "link": link, "article_text": article_text, "published": entry.get("published"), "source": "googlenews"})
+    except Exception:
+        pass
+
+if not articles:
+    reply = (f"Hey 👋 I couldn't find recent news about *{topic_text}* in my feeds right now. "
+             "Would you like me to search wider sources (Reddit, blogs) or set a watch/alert?")
+    # save
+    if email:
+        conv_name = f"nova_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:6]}"
+        save_sqlite_chat_history_append(email, {conv_name: {email: user_message, "Nova": reply}})
+    return {"reply": reply, "count": 0}
+
+# summarize found articles
+summaries = []
+for art in articles[:MAX_RESULTS]:
+    if not art.get("article_text"):
+        summaries.append({"headline": art.get("headline"), "link": art.get("link"), "summary": f"❗️ Couldn't extract text from the link. Link: {art.get('link')}", "source": art.get("source")})
+        continue
+    summary_text = summarize_article(art["article_text"], art.get("headline", topic_text), user_message)
+    summaries.append({"headline": art.get("headline": art.get("headline"), "link": art.get("link"), "summary": f"❗️ Couldn't extract text from the link. Link: {art.get('link')}", "source": art.get("source")})
             continue
-        summary_text = summarize_article(art["article_text"], art.get("headline", topic), user_message)
+        summary_text = summarize_article(art["article_text"], art.get("headline", topic_text), user_message)
         summaries.append({"headline": art.get("headline"), "link": art.get("link"), "summary": summary_text, "source": art.get("source"), "published": art.get("published")})
 
+    # build chatty reply
     blocks = []
     for i, s in enumerate(summaries, start=1):
-        block = f"{i}. {s.get('headline')}\n\n{s.get('summary')}\n\nLink: {s.get('link')}"
-        blocks.append(block)
-    combined_reply = "\n\n---\n\n".join(blocks)
-    followup_hint = "\n\nWould you like more detail on any of these (reply 'yes' or the number)?"
+        blocks.append(f"{i}. {s.get('headline')}
+
+{s.get('summary')}
+
+Link: {s.get('link')}")
+    combined_reply = "
+
+---
+
+".join(blocks)
+    suggestions = ("
+
+Suggestions: 
+"
+                   "• Reply with the article number to dive deeper (e.g. '1').
+"
+                   "• Reply 'watch' to create a simple watch/alert for this topic.
+"
+                   "• Reply 'more' to search wider sources (Reddit, blogs).
+")
+    chatty = f"Yo — here's what I found about *{topic_text}*:
+
+{combined_reply}
+
+{suggestions}
+— Nova ✌️"
+
+    # save conversation
     conv_name = f"nova_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:6]}"
-
-    # Save local + supabase
     if email:
-        save_local_conversation(email, conv_name, email, user_message, meta={"topic": topic})
-        save_local_conversation(email, conv_name, "nova", combined_reply + followup_hint, meta={"results": len(summaries)})
-    if email and supabase:
-        try:
-            user_key = email
-            conv_obj = {conv_name: {user_key: user_message, "Nova": combined_reply + followup_hint}}
-            save_supabase_chat_history_append(email, conv_obj)
-        except Exception as e:
-            print("Failed to append to supabase chat_history:", e)
+        save_sqlite_chat_history_append(email, {conv_name: {email: user_message, "Nova": chatty}})
+        if supabase:
+            try:
+                supabase.table("users").upsert({"email": email, "chat_history": fetch_sqlite_chat_history(email)}).execute()
+            except Exception:
+                pass
 
-    return {"reply": combined_reply + followup_hint, "count": len(summaries), "conversation": conv_name}
+    return {"reply": chatty, "count": len(summaries), "conversation": conv_name}
 
-# ---------- new endpoint: get single conversation ----------
+# ---------------- get a single conversation ----------------
 @app.post("/get_chat")
 def get_chat(req: GetChatReq):
     email = (req.user_email or "").strip().lower()
@@ -635,36 +340,27 @@ def get_chat(req: GetChatReq):
     if not conv_name:
         raise HTTPException(status_code=400, detail="conversation_name required")
 
-    # 1) Try supabase
+    # try sqlite
+    hist = fetch_sqlite_chat_history(email)
+    for obj in hist:
+        if isinstance(obj, dict) and conv_name in obj:
+            return {"found": True, "conversation": {conv_name: obj[conv_name]}}
+
+    # fallback to supabase if configured
     if supabase:
         try:
-            hist = fetch_supabase_chat_history(email)
-            # hist is list of objects like [{conv_name: {...}}, ...]
-            for obj in hist:
+            r = supabase.table("users").select("chat_history").eq("email", email).single().execute()
+            data = getattr(r, "data", None) or (r.get("data") if isinstance(r, dict) else None)
+            hist_s = data.get("chat_history", []) if data else []
+            for obj in hist_s:
                 if isinstance(obj, dict) and conv_name in obj:
                     return {"found": True, "conversation": {conv_name: obj[conv_name]}}
-            return {"found": False, "conversation": None, "message": f"Conversation '{conv_name}' not found for {email}."}
         except Exception as e:
             print("get_chat supabase error:", e)
-            # fall back to local
 
-    # 2) Fallback to in-memory store
-    if email in conversations:
-        convs = conversations[email].get("convs", {})
-        if conv_name in convs:
-            return {"found": True, "conversation": {conv_name: convs[conv_name]}}
-        # sometimes convs are stored as single list of {sender,text,...} (older shape)
-        return {"found": False, "conversation": None, "message": f"Conversation '{conv_name}' not found in local store for {email}."}
+    return {"found": False, "conversation": None, "message": f"Conversation '{conv_name}' not found for {email}."}
 
-    return {"found": False, "conversation": None, "message": "No conversation history found for this email."}
-
-# ---------- optional: endpoint to append a message to a conversation explicitly ----------
-class AppendReq(BaseModel):
-    user_email: str
-    conversation_name: str
-    sender: str
-    text: str
-
+# ---------------- append to conversation explicitly ----------------
 @app.post("/append_chat")
 def append_chat(req: AppendReq):
     email = (req.user_email or "").strip().lower()
@@ -674,16 +370,126 @@ def append_chat(req: AppendReq):
     if not email or not conv or not sender or not text:
         raise HTTPException(status_code=400, detail="email, conversation_name, sender, text required")
 
-    ts = datetime.utcnow().isoformat() + "Z"
-    # local save
-    save_local_conversation(email, conv, sender, text, meta={})
-    # supabase update
+    update_sqlite_conversation(email, conv, {sender: text})
     if supabase:
         try:
-            # create a small dict: { sender: text } and merge into conv
-            update_supabase_conversation(email, conv, {sender: text})
+            r = supabase.table("users").select("chat_history").eq("email", email).single().execute()
+            data = getattr(r, "data", None) or (r.get("data") if isinstance(r, dict) else None)
+            hist = data.get("chat_history", []) if data else []
+            sqlite_hist = fetch_sqlite_chat_history(email)
+            merged = sqlite_hist if sqlite_hist else hist
+            supabase.table("users").upsert({"email": email, "chat_history": merged}).execute()
         except Exception as e:
             print("append_chat supabase error:", e)
     return {"ok": True, "message": "Appended message to conversation."}
 
-# End of file
+# ---------------- list conversation names for an email ----------------
+@app.get("/list_chats")
+def list_chats(email: Optional[str] = None):
+    if not email:
+        raise HTTPException(status_code=400, detail="email query param required")
+    email = email.strip().lower()
+    hist = fetch_sqlite_chat_history(email)
+    names = []
+    for obj in hist:
+        if isinstance(obj, dict):
+            names.extend(list(obj.keys()))
+    return {"count": len(names), "conversations": names}
+
+# ---------------- delete / rename helpers & endpoints ----------------
+def delete_sqlite_conversation(email: str, conv_name: str):
+    hist = fetch_sqlite_chat_history(email) or []
+    new_hist = []
+    removed = False
+    for obj in hist:
+        if isinstance(obj, dict) and conv_name in obj:
+            removed = True
+            continue
+        new_hist.append(obj)
+    cur = DB.cursor()
+    cur.execute("UPDATE users SET chat_history = ? WHERE email = ?", (json.dumps(new_hist), email))
+    DB.commit()
+    return removed
+
+
+def rename_sqlite_conversation(email: str, old_name: str, new_name: str):
+    hist = fetch_sqlite_chat_history(email) or []
+    found = False
+    for i, obj in enumerate(hist):
+        if isinstance(obj, dict) and old_name in obj:
+            hist[i] = {new_name: obj[old_name]}
+            found = True
+            break
+    if found:
+        cur = DB.cursor()
+        cur.execute("UPDATE users SET chat_history = ? WHERE email = ?", (json.dumps(hist), email))
+        DB.commit()
+    return found
+
+class DeleteReq(BaseModel):
+    user_email: str
+    conversation_name: str
+
+class RenameReq(BaseModel):
+    user_email: str
+    old_name: str
+    new_name: str
+
+@app.post("/delete_chat")
+def delete_chat(req: DeleteReq):
+    email = (req.user_email or "").strip().lower()
+    conv = (req.conversation_name or "").strip()
+    if not email or not conv:
+        raise HTTPException(status_code=400, detail="user_email and conversation_name required")
+
+    removed = delete_sqlite_conversation(email, conv)
+    if supabase:
+        try:
+            r = supabase.table("users").select("chat_history").eq("email", email).single().execute()
+            data = getattr(r, "data", None) or (r.get("data") if isinstance(r, dict) else None)
+            hist = data.get("chat_history", []) if data else []
+            if isinstance(hist, list):
+                new_hist = [obj for obj in hist if not (isinstance(obj, dict) and conv in obj)]
+                supabase.table("users").update({"chat_history": new_hist}).eq("email", email).execute()
+                removed = removed or (len(new_hist) < len(hist))
+        except Exception as e:
+            print("delete_chat supabase error:", e)
+
+    if removed:
+        return {"ok": True, "message": f"Conversation '{conv}' deleted for {email}."}
+    return {"ok": False, "message": f"Conversation '{conv}' not found for {email}."}
+
+@app.post("/rename_chat")
+def rename_chat(req: RenameReq):
+    email = (req.user_email or "").strip().lower()
+    old = (req.old_name or "").strip()
+    new = (req.new_name or "").strip()
+    if not email or not old or not new:
+        raise HTTPException(status_code=400, detail="user_email, old_name, new_name required")
+
+    renamed = rename_sqlite_conversation(email, old, new)
+    if supabase:
+        try:
+            r = supabase.table("users").select("chat_history").eq("email", email).single().execute()
+            data = getattr(r, "data", None) or (r.get("data") if isinstance(r, dict) else None)
+            hist = data.get("chat_history", []) if data else []
+            if isinstance(hist, list):
+                for i, obj in enumerate(hist):
+                    if isinstance(obj, dict) and old in obj:
+                        hist[i] = {new: obj[old]}
+                        supabase.table("users").update({"chat_history": hist}).eq("email", email).execute()
+                        renamed = True
+                        break
+        except Exception as e:
+            print("rename_chat supabase error:", e)
+
+    if renamed:
+        return {"ok": True, "message": f"Conversation renamed from '{old}' to '{new}' for {email}."}
+    return {"ok": False, "message": f"Conversation '{old}' not found for {email}."}
+
+# ---------------- health ----------------
+@app.get("/health")
+def health():
+    return {"ok": True, "time": datetime.utcnow().isoformat()+"Z"}
+
+# ---------------- end of file ----------------
