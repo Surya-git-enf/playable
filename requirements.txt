@@ -1,8 +1,10 @@
 fastapi
-uvicorn
-sqlalchemy
-psycopg2-binary
-aiohttp
+uvicorn[standard]
+requests
 feedparser
+beautifulsoup4
+google-generativeai
+python-dateutil
 pydantic
+supabase
 python-dotenv
