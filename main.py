@@ -293,7 +293,7 @@ def generate_conversation_name(user_message: str) -> str:
             text = getattr(resp, "text", None)
             if text:
                 s = text.strip().splitlines()[0]
-                s = re.sub(r"[\\"']", "", s).strip()
+                s = re.sub(r'["\']', '', s).strip()
                 s = re.sub(r"\s+", " ", s)
                 return s[:60]
     except Exception:
@@ -778,3 +778,4 @@ def delete_chat(req: DeleteReq):
 @app.get("/health")
 def health():
     return {"ok": True, "time": datetime.utcnow().isoformat()+"Z"}
+                                
