@@ -94,6 +94,7 @@ KEYWORD_CATEGORY = {
     "google": "tech",
     "apple": "tech",
     "markets": "business",
+    "tech": "tech",
 }
 
 # ---------------- MODELS / INPUT ----------------
@@ -319,8 +320,8 @@ CATEGORY_PATH_KEYWORDS = ["/tech", "/technology", "/space", "/nasa", "/science",
 def search_rss_for_topic(topic: str, max_items=30, category: Optional[str]=None):
     topic_l = (topic or "").lower().strip()
     found = []
+    feeds_to_check: List[str] = []
     try:
-        feeds_to_check: List[str] = []
         if category and category in CATEGORY_FEEDS:
             feeds_to_check += CATEGORY_FEEDS[category]
         for u in RSS_FEEDS:
@@ -361,7 +362,8 @@ def search_rss_for_topic(topic: str, max_items=30, category: Optional[str]=None)
         except Exception:
             return datetime.min
     found.sort(key=score_item, reverse=True)
-    return found
+    # return both results and feeds checked (for friendly mention)
+    return found, feeds_to_check
 
 def extract_article_text(url: str, max_chars: int = 15000):
     if not url:
@@ -508,10 +510,10 @@ def decide_need_news(user_message: str):
     msg = (user_message or "").strip()
     if not msg:
         return False, None, ""
-    # greeting-only and short -> no news
-    if len(msg) < 60 and GREETINGS_RE.search(msg) and not any(k in msg.lower() for k in NEWS_INTENT_KEYWORDS):
-        return False, None, msg
     low = msg.lower()
+    # greeting-only detection: short + only greeting words
+    if len(msg) < 60 and GREETINGS_RE.search(msg) and not any(k in low for k in NEWS_INTENT_KEYWORDS) and len(re.sub(r"\b(hi|hello|hey|hiya|greetings)\b", "", low).strip()) < 2:
+        return False, "greeting", msg
     if any(k in low for k in NEWS_INTENT_KEYWORDS):
         topic = extract_topic_from_message(msg)
         return True, None, topic
@@ -531,7 +533,7 @@ def chat(req: ChatReq):
     conv_name_in = (req.conversation_name or "").strip() or None
 
     # decide news intent and extract a cleaner topic
-    need_news, category, topic_text = decide_need_news(user_message)
+    need_news, special_flag, topic_text = decide_need_news(user_message)
 
     # If conversation name provided -> append to that conversation (create if missing)
     # If no conversation name provided -> create a new conversation for this chat (auto name)
@@ -563,16 +565,27 @@ def chat(req: ChatReq):
             except Exception as e:
                 print("supabase upsert (after user message) error:", e)
 
+    # If greeting-only -> respond warmly and personally
+    if special_flag == "greeting":
+        reply = "Hello 👋 how are you? I'm Nova — your news + chat buddy. 😊 Ask me for news, a summary, or anything you'd like."
+        if email:
+            append_message_to_conversation(email, conv_name, "Nova", reply)
+            if supabase:
+                try:
+                    supabase.table("users").upsert({"email": email, "chat_history": fetch_sqlite_chat_history(email)}).execute()
+                except Exception as e:
+                    print("supabase upsert (greet) error:", e)
+        return {"reply": reply, "conversation": conv_name}
+
     # If not news, reply conversationally (chatty, not robotic)
     if not need_news:
         low = user_message.lower()
         if any(g in low for g in ("help","suggest","what can you do","how can you")):
-            reply = ("Hey — I'm Nova. I can fetch and summarize news, save conversations, and generate short chat titles. "
-                     "Try: 'news about AI' or 'latest on NASA' or just say what you want and I'll search for it.")
+            reply = ("Hey! I'm Nova — I can fetch and summarize news, save conversations with short titles, and keep watching topics for updates. "
+                     "Try: 'news about AI' or 'latest on NASA' or ask me to save this chat.")
         else:
-            # more ChatGPT-style friendly response (no heavy framing like 'here are the results for')
-            reply = (f"Got it — {user_message}. What would you like me to do with that? "
-                     "I can look up news, summarize articles, or save this conversation with a short title.")
+            # friendly chat-style reply
+            reply = (f"Nice — {user_message}\n\nI'm here to chat like a buddy. Want me to look up news, summarize something, or save this conversation with a short name?")
 
         if email:
             append_message_to_conversation(email, conv_name, "Nova", reply)
@@ -584,40 +597,40 @@ def chat(req: ChatReq):
         return {"reply": reply, "conversation": conv_name}
 
     # --- need_news True: perform feed search using the extracted topic_text ---
+    # pick category from keywords if possible (so we prefer category feeds)
+    inferred_category = map_keyword_to_category(topic_text) or None
     sheet_rows = fetch_sheet_rows(SHEET_ID, SHEET_GID) if SHEET_ID else []
     articles = []
 
-    def add_matches_for_topic(t, cat=None):
-        nonlocal articles
-        # (1) sheet matches
-        if sheet_rows:
-            try:
-                for r in sheet_rows:
-                    combined = " ".join([r.get("headline",""), r.get("news",""), r.get("categories",""), r.get("link","")]).lower()
-                    if t.lower() in combined:
-                        headline = r.get("headline") or r.get("title") or t
-                        link = r.get("link") or ""
-                        article_text = r.get("news") or r.get("summary") or ""
-                        published = r.get("date") or None
-                        if link and not article_text:
-                            article_text = extract_article_text(link)
-                        articles.append({"headline": headline, "link": link, "article_text": article_text, "published": published, "source": "sheet"})
-                        if len(articles) >= MAX_RESULTS:
-                            return
-            except Exception as e:
-                print("sheet search err", e)
-        # (2) rss (enhanced matching)
-        if len(articles) < MAX_RESULTS:
-            rss_found = search_rss_for_topic(t, max_items=30, category=cat)
-            for item in rss_found:
-                if len(articles) >= MAX_RESULTS:
-                    break
-                link = item.get("link")
-                headline = item.get("headline") or t
-                article_text = extract_article_text(link) or item.get("summary") or ""
-                articles.append({"headline": headline, "link": link, "article_text": article_text, "published": item.get("published"), "source": "rss"})
+    # Use search_rss_for_topic which returns results and feeds checked
+    rss_found, feeds_checked = search_rss_for_topic(topic_text, max_items=40, category=inferred_category)
 
-    add_matches_for_topic(topic_text, category)
+    # Try sheet matches first
+    if sheet_rows:
+        try:
+            for r in sheet_rows:
+                combined = " ".join([r.get("headline",""), r.get("news",""), r.get("categories",""), r.get("link","")]).lower()
+                if topic_text.lower() in combined:
+                    headline = r.get("headline") or r.get("title") or topic_text
+                    link = r.get("link") or ""
+                    article_text = r.get("news") or r.get("summary") or ""
+                    published = r.get("date") or None
+                    if link and not article_text:
+                        article_text = extract_article_text(link)
+                    articles.append({"headline": headline, "link": link, "article_text": article_text, "published": published, "source": "sheet"})
+                    if len(articles) >= MAX_RESULTS:
+                        break
+        except Exception as e:
+            print("sheet search err", e)
+
+    # Add RSS-found items
+    for item in rss_found:
+        if len(articles) >= MAX_RESULTS:
+            break
+        link = item.get("link")
+        headline = item.get("headline") or topic_text
+        article_text = extract_article_text(link) or item.get("summary") or ""
+        articles.append({"headline": headline, "link": link, "article_text": article_text, "published": item.get("published"), "source": "rss"})
 
     # fallback: google news rss if nothing found
     if not articles:
@@ -630,13 +643,15 @@ def chat(req: ChatReq):
                 link = entry.get("link")
                 article_text = extract_article_text(link) or entry.get("summary") or ""
                 articles.append({"headline": headline, "link": link, "article_text": article_text, "published": entry.get("published"), "source": "googlenews"})
+            # add google news to feeds_checked for transparency
+            feeds_checked = feeds_checked + [gurl]
         except Exception:
             pass
 
     # If still none, produce a generative fallback summary (user should always get a reply)
     if not articles:
         summary_text = summarize_topic_fallback(topic_text, user_message)
-        chatty = f"Thanks — I couldn't find fresh articles in my feeds.\n\n{summary_text}\n\n— Nova"
+        chatty = f"Hey — I couldn't find fresh articles in the feeds I checked.\n\n{summary_text}\n\n— Nova"
         if email:
             append_message_to_conversation(email, conv_name, "Nova", chatty)
             if supabase:
@@ -660,15 +675,27 @@ def chat(req: ChatReq):
         summary_text = summarize_article(art["article_text"], art.get("headline", topic_text), user_message)
         summaries.append({"headline": art.get("headline"), "link": art.get("link"), "summary": summary_text, "source": art.get("source"), "published": art.get("published")})
 
-    # Build a friendly chat-style reply (avoid 'here are the results for \"<raw message>\"')
+    # Build a friendly chat-style reply — mention a few sources (domain names) we checked
     short_topic = topic_text if len(topic_text) < 80 else topic_text[:80] + "..."
+    # get domains (unique) for friendly mention
+    domains = []
+    for f in feeds_checked:
+        try:
+            d = urlparse(f).netloc.replace("www.", "")
+            if d and d not in domains:
+                domains.append(d)
+        except Exception:
+            pass
+    # limit the list to 5 domains for brevity
+    domains_display = ", ".join(domains[:5]) if domains else "multiple sources"
     blocks = []
     for i, s in enumerate(summaries, start=1):
         blocks.append(f"{i}. {s.get('headline')}\n\n{s.get('summary')}\n\nLink: {s.get('link')}")
     combined_reply = "\n\n---\n\n".join(blocks)
     suggestions = ("\n\nIf you want, reply with the article number to read more (e.g. '1'), "
                    "or say 'watch' to create an alert for this topic.\n")
-    chatty = (f"Here are a few recent articles about {short_topic}:\n\n{combined_reply}\n\n{suggestions}\n— Nova")
+    chatty = (f"Hey! I checked {domains_display} and found a few recent stories about {short_topic}:\n\n"
+             f"{combined_reply}\n\n{suggestions}\n— Nova")
 
     # Append Nova reply to conversation + supabase upsert
     if email:
@@ -778,4 +805,3 @@ def delete_chat(req: DeleteReq):
 @app.get("/health")
 def health():
     return {"ok": True, "time": datetime.utcnow().isoformat()+"Z"}
-                                
