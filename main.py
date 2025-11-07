@@ -282,7 +282,7 @@ def generate_conversation_name(user_message: str) -> str:
                 text = getattr(resp.output[0], "content", None) or getattr(resp.output[0], "text", None)
             if text:
                 s = text.strip().splitlines()[0]
-                s = re.sub(r"[\\"']", "", s).strip()
+                s = re.sub(r'["\']', '', s).strip()
                 s = re.sub(r"\s+", " ", s)
                 return s[:60]
     except Exception:
