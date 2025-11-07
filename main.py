@@ -1,22 +1,30 @@
 # main.py
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
-from datetime import datetime, timezone
-import os, json, csv, io, traceback, requests, re, uuid, sqlite3
+from datetime import datetime, timezone, timedelta
+import os, json, csv, io, traceback, requests, re, uuid, sqlite3, time
 from bs4 import BeautifulSoup
 import feedparser
 import google.generativeai as genai
 from dateutil import parser as dateparser
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from urllib.parse import urlparse
 
-# optional supabase (if installed)
+# Optional: Supabase client
 try:
-    from supabase import create_client
+    from supabase import create_client as create_supabase_client
 except Exception:
-    create_client = None
+    create_supabase_client = None
 
-app = FastAPI(title="Nova — Friendly News + Chat Assistant (modified)")
+# Optional: Google Sheets append via gspread (service account JSON path required)
+try:
+    import gspread
+    from oauth2client.service_account import ServiceAccountCredentials
+except Exception:
+    gspread = None
+    ServiceAccountCredentials = None
+
+app = FastAPI(title="Nova — n8n-style News + Chat Assistant")
 
 # ---------------- CONFIG ----------------
 GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
@@ -25,66 +33,107 @@ SHEET_ID = os.getenv("SHEET_ID", "").strip()
 SHEET_GID = os.getenv("SHEET_GID", "0").strip()
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
+GOOGLE_SA_JSON = os.getenv("GOOGLE_SERVICE_ACCOUNT_JSON", "").strip()  # path to JSON file (optional)
 MAX_RESULTS = int(os.getenv("MAX_RESULTS", "3"))
-DAYS_LIMIT = int(os.getenv("DAYS_LIMIT", "2"))
 EXTRA_RSS = os.getenv("RSS_FEEDS", "").strip()
-SQLITE_DB = os.getenv("SQLITE_DB", "nova_cache.db")
+CACHE_MAX_AGE_HOURS = int(os.getenv("CACHE_MAX_AGE_HOURS", "24"))  # sheet cache freshness window
 
 if not GEMINI_API_KEY:
     raise RuntimeError("Please set GEMINI_API_KEY in environment variables.")
 
-# configure genai
 genai.configure(api_key=GEMINI_API_KEY)
 
-# supabase client if provided
+# Supabase init (optional)
 supabase = None
-if SUPABASE_URL and SUPABASE_KEY and create_client is not None:
+if SUPABASE_URL and SUPABASE_KEY and create_supabase_client is not None:
     try:
-        supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+        supabase = create_supabase_client(SUPABASE_URL, SUPABASE_KEY)
     except Exception as e:
-        print("Supabase init error:", e)
+        print("Supabase init failed:", e)
         supabase = None
 
-# ---------------- RSS FEEDS (expanded) ----------------
+# Google Sheets client init (optional)
+gspread_client = None
+if GOOGLE_SA_JSON and gspread is not None and ServiceAccountCredentials is not None:
+    try:
+        scope = ["https://www.googleapis.com/auth/spreadsheets", "https://www.googleapis.com/auth/drive"]
+        creds = ServiceAccountCredentials.from_json_keyfile_name(GOOGLE_SA_JSON, scope)
+        gspread_client = gspread.authorize(creds)
+    except Exception as e:
+        print("gspread init error:", e)
+        gspread_client = None
+
+# ---------------- SYSTEM PROMPT ----------------
+SYSTEM_PROMPT = """
+You are NewsAssistant, a helpful, accurate, concise news agent. When a user asks for news, follow this flow:
+
+1) IDENTIFY request: extract {topic_query}, {scope}, {timeframe}, {language}. Default => top 5 headlines last 24 hours, 2-sentence summaries.
+2) CHECK CHAT HISTORY & PREFS: read Supabase 'user_chats' table chat_history to avoid duplicates and respect preferences.
+3) LOOKUP CACHED NEWS in Google Sheets (sheet: news_cache). If fresh, return those first.
+4) IF NOT FOUND: query RSS feeds (category-first, then fallback list). Fetch up to N=5, dedupe identical URLs.
+5) RANK & FORMAT: newest first. For each produce: headline, 1-2 sentence summary, source, ISO date, url, short 'why this matters' if helpful.
+6) WRITE-BACK: append new items to Google Sheets (skip if url exists).
+7) RESPONSE RULES: concise, chat-style, include source+url, end with a single friendly question (e.g., "Want me to fetch the full article?").
+8) PRIVACY & RATE LIMITS: don't expose credentials or raw feed URLs in replies; do not re-fetch the same feed more than once/minute per user.
+"""
+
+# ---------------- RATE LIMITER CONFIG ----------------
+# Do not fetch the same feed more than once per user within RATE_LIMIT_SECONDS (in-memory).
+RATE_LIMIT_SECONDS = 60
+# mapping (user_email, feed_url) -> last_fetch_unix_seconds
+FEED_FETCH_TIMES: Dict[Tuple[str, str], float] = {}
+
+# ---------------- RSS and Category feeds (from your n8n blueprint) ----------------
 DEFAULT_RSS_FEEDS = [
+    # world & general
     "http://feeds.bbci.co.uk/news/rss.xml",
     "http://rss.cnn.com/rss/edition.rss",
     "https://www.theguardian.com/world/rss",
     "https://feeds.reuters.com/reuters/topNews",
-    "https://feeds.npr.org/1001/rss.xml",
     # tech
-    "https://techcrunch.com/feed/",
-    "https://www.theverge.com/rss/index.xml",
     "https://feeds.arstechnica.com/arstechnica/index",
-    # business
-    "https://feeds.a.dj.com/rss/RSSWorldNews.xml",
-    "https://feeds.reuters.com/reuters/businessNews",
-    # space / science
+    "https://www.theverge.com/rss/index.xml",
+    "https://feeds.feedburner.com/TechCrunch/",
+    "https://www.wired.com/feed/rss",
+    # space / nasa
     "https://www.nasa.gov/rss/dyn/breaking_news.rss",
     "https://www.space.com/feeds/all",
-    "https://www.sciencedaily.com/rss/top/science.xml",
+    "https://phys.org/rss-feed/space-news/",
+    # business / finance
+    "https://feeds.bbci.co.uk/news/business/rss.xml",
+    "https://feeds.reuters.com/reuters/businessNews",
 ]
+# allow extra feeds from env var
+if EXTRA_RSS:
+    for e in EXTRA_RSS.split(","):
+        e = e.strip()
+        if e and e not in DEFAULT_RSS_FEEDS:
+            DEFAULT_RSS_FEEDS.append(e)
 
 CATEGORY_FEEDS = {
     "space": [
         "https://www.nasa.gov/rss/dyn/breaking_news.rss",
         "https://www.space.com/feeds/all",
-        "https://www.spaceflightnow.com/launch-feed/",
+        "https://phys.org/rss-feed/space-news/",
+        "https://www.sciencedaily.com/rss/top/space_rss.xml",
     ],
     "tech": [
-        "https://techcrunch.com/feed/",
-        "https://www.theverge.com/rss/index.xml",
         "https://feeds.arstechnica.com/arstechnica/index",
+        "https://www.theverge.com/rss/index.xml",
+        "https://feeds.feedburner.com/TechCrunch/",
+        "https://www.wired.com/feed/rss",
     ],
     "business": [
-        "https://feeds.a.dj.com/rss/RSSWorldNews.xml",
+        "https://feeds.bbci.co.uk/news/business/rss.xml",
         "https://feeds.reuters.com/reuters/businessNews",
+    ],
+    "world": [
+        "http://feeds.bbci.co.uk/news/rss.xml",
+        "http://rss.cnn.com/rss/edition.rss",
+        "https://feeds.reuters.com/reuters/topNews",
     ],
 }
 
-RSS_FEEDS = (EXTRA_RSS.split(",") if EXTRA_RSS else []) + DEFAULT_RSS_FEEDS
-
-# quick keyword -> category (kept for fallback)
 KEYWORD_CATEGORY = {
     "nasa": "space",
     "space": "space",
@@ -93,8 +142,10 @@ KEYWORD_CATEGORY = {
     "ai": "tech",
     "google": "tech",
     "apple": "tech",
+    "tesla": "tech",
     "markets": "business",
-    "tech": "tech",
+    "business": "business",
+    "world": "world",
 }
 
 # ---------------- MODELS / INPUT ----------------
@@ -103,26 +154,8 @@ class ChatReq(BaseModel):
     message: str
     conversation_name: Optional[str] = None
 
-class GetChatReq(BaseModel):
-    email: str
-    conversation_name: str
-
-class RenameReq(BaseModel):
-    user_email: str
-    old_name: str
-    new_name: str
-
-class DeleteReq(BaseModel):
-    user_email: str
-    conversation_name: str
-
-class AppendReq(BaseModel):
-    user_email: str
-    conversation_name: str
-    sender: str
-    text: str
-
-# ---------------- SIMPLE SQLITE DB ----------------
+# ---------------- SIMPLE SQLITE (local fallback for storing user chats) ----------------
+SQLITE_DB = os.getenv("SQLITE_DB", "nova_cache.db")
 def init_db():
     conn = sqlite3.connect(SQLITE_DB, check_same_thread=False)
     cur = conn.cursor()
@@ -133,7 +166,6 @@ def init_db():
     )""")
     conn.commit()
     return conn
-
 DB = init_db()
 
 def get_user_row_sqlite(email: str):
@@ -166,23 +198,14 @@ def save_sqlite_chat_history(email: str, hist: List[dict]):
     DB.commit()
     return True
 
-def append_new_conversation(email: str, conv_name: str, messages: List[dict]):
-    ensure_user_row_sqlite(email)
-    hist = fetch_sqlite_chat_history(email) or []
-    hist.append({conv_name: messages})
-    save_sqlite_chat_history(email, hist)
-    return True
-
-def find_conversation_index(hist: List[dict], conv_name: str) -> int:
-    for i, obj in enumerate(hist):
-        if isinstance(obj, dict) and conv_name in obj:
-            return i
-    return -1
-
 def append_message_to_conversation(email: str, conv_name: str, sender: str, text: str):
     ensure_user_row_sqlite(email)
     hist = fetch_sqlite_chat_history(email) or []
-    idx = find_conversation_index(hist, conv_name)
+    idx = -1
+    for i, obj in enumerate(hist):
+        if isinstance(obj, dict) and conv_name in obj:
+            idx = i
+            break
     msg = {"sender": sender, "text": text, "ts": datetime.utcnow().isoformat()+"Z"}
     if idx >= 0:
         hist[idx][conv_name].append(msg)
@@ -191,28 +214,34 @@ def append_message_to_conversation(email: str, conv_name: str, sender: str, text
     save_sqlite_chat_history(email, hist)
     return True
 
-def rename_sqlite_conversation(email: str, old_name: str, new_name: str):
-    hist = fetch_sqlite_chat_history(email) or []
-    idx = find_conversation_index(hist, old_name)
-    if idx < 0:
+def supabase_get_user(email: str):
+    if not supabase:
+        return None
+    try:
+        r = supabase.table("users").select("chat_history").eq("email", email).single().execute()
+        data = getattr(r, "data", None) or (r.get("data") if isinstance(r, dict) else None)
+        return data
+    except Exception as e:
+        print("supabase get error:", e)
+        return None
+
+def supabase_upsert_user(email: str):
+    if not supabase:
         return False
-    hist[idx] = {new_name: hist[idx][old_name]}
-    save_sqlite_chat_history(email, hist)
-    return True
+    try:
+        hist = fetch_sqlite_chat_history(email)
+        supabase.table("users").upsert({"email": email, "chat_history": hist}).execute()
+        return True
+    except Exception as e:
+        print("supabase upsert error:", e)
+        return False
 
-def delete_sqlite_conversation(email: str, conv_name: str):
-    hist = fetch_sqlite_chat_history(email) or []
-    new_hist = [obj for obj in hist if not (isinstance(obj, dict) and conv_name in obj)]
-    changed = len(new_hist) < len(hist)
-    if changed:
-        save_sqlite_chat_history(email, new_hist)
-    return changed
-
-# ---------------- UTILITIES: sheets / rss / article extract ----------------
+# ---------------- Google Sheet helpers (read-only via CSV export; append optional via gspread) ----------------
 def sheet_csv_url(sheet_id: str, gid: str = "0"):
     return f"https://docs.google.com/spreadsheets/d/{sheet_id}/export?format=csv&gid={gid}"
 
-def fetch_sheet_rows(sheet_id: str, gid: str = "0"):
+def fetch_sheet_rows(sheet_id: str, gid: str = "0") -> List[dict]:
+    """Return list of rows (dict). Works even without GCP creds by using public/csv export or if sheet is shared."""
     if not sheet_id:
         return []
     try:
@@ -228,107 +257,59 @@ def fetch_sheet_rows(sheet_id: str, gid: str = "0"):
         return rows
     except Exception as e:
         print("Sheet fetch error:", e)
-        traceback.print_exc()
+        # don't crash — return empty
         return []
 
-def parse_date_safe(date_str: str):
-    if not date_str:
-        return None
+def append_row_to_sheet(sheet_id: str, values: List[str], sheet_gname: str = None) -> bool:
+    """
+    Append row using gspread if available and service account path was provided.
+    values should be a list matching the sheet columns.
+    """
+    if not gspread_client or not sheet_id:
+        return False
     try:
-        dt = dateparser.parse(date_str)
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except Exception:
-        try:
-            return datetime.strptime(date_str.split("T")[0], "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        except Exception:
-            return None
+        sh = gspread_client.open_by_key(sheet_id)
+        if sheet_gname:
+            ws = sh.worksheet(sheet_gname)
+        else:
+            ws = sh.get_worksheet(0)
+        ws.append_row(values, value_input_option="USER_ENTERED")
+        return True
+    except Exception as e:
+        print("append_row_to_sheet error:", e)
+        return False
 
-# try to extract a short topic from natural language like 'about X' or 'on X'
-def extract_topic_from_message(msg: str) -> str:
-    if not msg:
-        return "news"
-    m = re.search(r"(?:about|on|regarding|regarding:|regarding\s)([^?.!]+)", msg, re.I)
-    if not m:
-        # try phrase after 'news' or 'latest'
-        m = re.search(r"(?:news|latest|updates?)\s(?:about\s)?([^?.!]+)", msg, re.I)
-    if m:
-        topic = m.group(1).strip()
-        # trim filler like 'today' 'please' at end
-        topic = re.sub(r"\b(today|please|now|for my project|for my|for)\b", "", topic, flags=re.I).strip()
-        # crop length
-        return topic[:120].strip()
-    # fallback: take important nouns by removing greetings and short verbs
-    cleaned = re.sub(r"\b(hey|hi|hello|buddy|please|can i|could you|i want|i'd like|i want to)\b", "", msg, flags=re.I)
-    cleaned = cleaned.strip()
-    if len(cleaned) > 0 and len(cleaned) < 140:
-        return cleaned
-    return "news"
-
-# Generate a concise conversation title using Gemini (<=4 words ideally)
-def generate_conversation_name(user_message: str) -> str:
-    base_fallback = re.sub(r"[^\w\s-]", "", user_message)[:40].strip()
-    prompt = (
-        "You are a helpful assistant. Create a short, descriptive conversation title (max 4 words) suitable as a chat/conversation name. "
-        f"Make it concise and human-friendly. Message: {user_message}\n\nTitle:"
-    )
-    try:
-        # try several SDK entrypoints gracefully
-        if hasattr(genai, "Client"):
-            client = genai.Client()
-            resp = client.models.generate_content(model=MODEL_NAME, contents=prompt)
-            text = getattr(resp, "text", None)
-            if not text and hasattr(resp, "output") and isinstance(resp.output, (list, tuple)) and resp.output:
-                text = getattr(resp.output[0], "content", None) or getattr(resp.output[0], "text", None)
-            if text:
-                s = text.strip().splitlines()[0]
-                s = re.sub(r'["\']', '', s).strip()
-                s = re.sub(r"\s+", " ", s)
-                return s[:60]
-    except Exception:
-        pass
-    try:
-        if hasattr(genai, "generate_content"):
-            resp = genai.generate_content(model=MODEL_NAME, prompt=prompt)
-            text = getattr(resp, "text", None)
-            if text:
-                s = text.strip().splitlines()[0]
-                s = re.sub(r'["\']', '', s).strip()
-                s = re.sub(r"\s+", " ", s)
-                return s[:60]
-    except Exception:
-        pass
-    # hard fallback: take first 3-4 words
-    parts = re.findall(r"\w+", base_fallback)
-    title = " ".join(parts[:4]) or "chat"
-    return title
-
-# Map a topic keyword to a category (fallback)
-def map_keyword_to_category(topic: str):
-    for k, cat in KEYWORD_CATEGORY.items():
-        if k in topic.lower():
-            return cat
-    for cat in ["space", "tech", "business", "world", "sports", "entertainment"]:
-        if cat in topic.lower():
-            return cat
-    return None
-
-# Enhanced RSS search: prefer entries where link path contains category-like segments (e.g. /tech/, /space/, /nasa/).
+# ---------------- RSS Search / Extraction ----------------
 CATEGORY_PATH_KEYWORDS = ["/tech", "/technology", "/space", "/nasa", "/science", "/business", "/sports", "/entertainment", "/world"]
 
-def search_rss_for_topic(topic: str, max_items=30, category: Optional[str]=None):
+def search_rss_for_topic(topic: str, user_email: Optional[str] = None, max_items=30, category: Optional[str]=None) -> Tuple[List[dict], List[str]]:
+    """Search the configured feeds and return (found_items, feeds_checked). Items are dicts with headline, link, summary, published, source_feed.
+       This function enforces per-user per-feed rate limit using FEED_FETCH_TIMES."""
     topic_l = (topic or "").lower().strip()
     found = []
-    feeds_to_check: List[str] = []
+    feeds_checked = []
+    feeds_to_check = []
     try:
         if category and category in CATEGORY_FEEDS:
             feeds_to_check += CATEGORY_FEEDS[category]
-        for u in RSS_FEEDS:
+        # always add global defaults
+        for u in DEFAULT_RSS_FEEDS:
             if u not in feeds_to_check:
                 feeds_to_check.append(u)
-
+        # track checked feeds
         for feed_url in feeds_to_check:
+            feeds_checked.append(feed_url)
+            # rate-limit: skip if this user recently fetched this feed
+            if user_email:
+                key = (user_email, feed_url)
+                last = FEED_FETCH_TIMES.get(key)
+                now_ts = time.time()
+                if last and (now_ts - last) < RATE_LIMIT_SECONDS:
+                    # skip fetching this feed to respect rate limit
+                    # (we still note it in feeds_checked but do not parse it)
+                    continue
+                # otherwise mark as fetched now
+                FEED_FETCH_TIMES[key] = now_ts
             try:
                 feed = feedparser.parse(feed_url)
                 for entry in feed.entries[:max_items]:
@@ -337,12 +318,8 @@ def search_rss_for_topic(topic: str, max_items=30, category: Optional[str]=None)
                     link = entry.get("link") or ""
                     tags = " ".join([t.get('term','') for t in entry.get('tags', [])]) if entry.get('tags') else ""
                     link_l = (link or "").lower()
-
-                    # match by content (title/summary/tags) OR by link path keywords
                     match_by_content = (topic_l and (topic_l in title or topic_l in summary or topic_l in tags.lower()))
                     match_by_path = any(k in link_l for k in CATEGORY_PATH_KEYWORDS)
-
-                    # If the user provided a specific topic, prefer content matches; otherwise allow path-based matches
                     if (topic_l and match_by_content) or (not topic_l and match_by_path) or (topic_l and match_by_path):
                         found.append({
                             "headline": entry.get("title"),
@@ -362,10 +339,9 @@ def search_rss_for_topic(topic: str, max_items=30, category: Optional[str]=None)
         except Exception:
             return datetime.min
     found.sort(key=score_item, reverse=True)
-    # return both results and feeds checked (for friendly mention)
-    return found, feeds_to_check
+    return found, feeds_checked
 
-def extract_article_text(url: str, max_chars: int = 15000):
+def extract_article_text(url: str, max_chars: int = 15000) -> Optional[str]:
     if not url:
         return None
     try:
@@ -381,6 +357,7 @@ def extract_article_text(url: str, max_chars: int = 15000):
                 if t:
                     texts.append(t)
         else:
+            # fallback: pick paragraphs that look long enough
             for p in soup.find_all("p"):
                 t = p.get_text(strip=True)
                 if t and len(t) > 40:
@@ -397,100 +374,28 @@ def extract_article_text(url: str, max_chars: int = 15000):
         return content
     except Exception as e:
         print("Article extraction error:", e)
-        traceback.print_exc()
         return None
 
-# ---------------- Gemini robust summarizer ----------------
-def summarize_article(article_text: str, headline: str, user_message: str):
-    try:
-        prompt = (
-            "You are Nova — a friendly, concise AI news reporter.\n"
-            "Summarize the article below in 2-4 short paragraphs with clear facts. "
-            "Then produce one short tailored follow-up question the user might want next (1 sentence).\n\n"
-            f"User message: {user_message}\n\n"
-            f"Headline: {headline}\n\n"
-            f"Article:\n{article_text}\n\n"
-            "Summary:"
-        )
-        # try multiple SDK shapes (robust)
-        try:
-            if hasattr(genai, "Client"):
-                client = genai.Client()
-                resp = client.models.generate_content(model=MODEL_NAME, contents=prompt)
-                text = getattr(resp, "text", None)
-                if not text and hasattr(resp, "output") and isinstance(resp.output, (list, tuple)) and resp.output:
-                    text = getattr(resp.output[0], "content", None) or getattr(resp.output[0], "text", None)
-                if text:
-                    return text.strip()
-        except Exception as e:
-            print("genai.Client() call failed:", e)
-        try:
-            if hasattr(genai, "GenerativeModel"):
-                model = genai.GenerativeModel(MODEL_NAME)
-                for call_args in ( (prompt,), {"prompt": prompt}, {"contents": prompt} ):
-                    try:
-                        resp = model.generate_content(*call_args) if isinstance(call_args, tuple) else model.generate_content(**call_args)
-                        text = getattr(resp, "text", None)
-                        if text:
-                            return text.strip()
-                    except Exception:
-                        continue
-        except Exception as e:
-            print("GenerativeModel() call failed:", e)
-        try:
-            if hasattr(genai, "generate_content"):
-                resp = genai.generate_content(model=MODEL_NAME, prompt=prompt)
-                text = getattr(resp, "text", None)
-                if text:
-                    return text.strip()
-        except Exception as e:
-            print("genai.generate_content() call failed:", e)
-        # fallback extractive snippet
-        paragraphs = article_text.split("\n\n")
-        short = "\n\n".join(paragraphs[:2]).strip()
-        fallback = (f"⚠️ Couldn't get a GenAI summary (SDK mismatch or quota). "
-                    f"Here is an extract:\n\n{short}\n\nWould you like me to try again or open the original link?")
-        return fallback
-    except Exception as e:
-        print("Gemini summarizer final error:", e)
-        traceback.print_exc()
-        return "⚠️ Sorry — error while generating summary: Gemini unavailable."
-
-# ---------------- fallback topic summarizer (news not found) ----------------
-def summarize_topic_fallback(topic: str, user_message: str):
-    prompt = (
-        "You are Nova — a friendly, concise AI news assistant.\n"
-        "The user asked about this topic and I couldn't find direct articles in feeds.\n"
-        "Provide a short chatty but factual summary (2-4 short paragraphs) of what is known about the topic right now, "
-        "and one short question or suggestion the user might want next.\n\n"
-        f"User message: {user_message}\n\n"
-        f"Topic: {topic}\n\n"
-        "Summary:"
+# ---------------- Gemini summarization helpers (SYSTEM_PROMPT prepended) ----------------
+def summarize_article_with_gemini(article_text: str, headline: str, user_message: str) -> str:
+    # Build the model prompt by prepending the system prompt (workflow) + user context
+    prompt = SYSTEM_PROMPT + "\n\n" + (
+        "User message: " + (user_message or "") + "\n\n"
+        "Headline: " + (headline or "") + "\n\n"
+        "Article:\n" + (article_text or "") + "\n\n"
+        "Now provide: a 1-2 sentence summary (conversational), source and ISO date, and one friendly follow-up question."
     )
     try:
         if hasattr(genai, "Client"):
             client = genai.Client()
             resp = client.models.generate_content(model=MODEL_NAME, contents=prompt)
             text = getattr(resp, "text", None)
-            if not text and hasattr(resp, "output") and isinstance(resp.output, (list,tuple)) and resp.output:
+            if not text and hasattr(resp, "output") and isinstance(resp.output, (list, tuple)) and resp.output:
                 text = getattr(resp.output[0], "content", None) or getattr(resp.output[0], "text", None)
             if text:
                 return text.strip()
     except Exception as e:
-        print("fallback genai.Client failed:", e)
-    try:
-        if hasattr(genai, "GenerativeModel"):
-            model = genai.GenerativeModel(MODEL_NAME)
-            for call_args in ( (prompt,), {"prompt": prompt}, {"contents": prompt} ):
-                try:
-                    resp = model.generate_content(*call_args) if isinstance(call_args, tuple) else model.generate_content(**call_args)
-                    text = getattr(resp, "text", None)
-                    if text:
-                        return text.strip()
-                except Exception:
-                    continue
-    except Exception as e:
-        print("fallback GenerativeModel failed:", e)
+        print("genai.Client() call failed:", e)
     try:
         if hasattr(genai, "generate_content"):
             resp = genai.generate_content(model=MODEL_NAME, prompt=prompt)
@@ -498,32 +403,38 @@ def summarize_topic_fallback(topic: str, user_message: str):
             if text:
                 return text.strip()
     except Exception as e:
-        print("fallback genai.generate_content failed:", e)
-    return (f"I couldn't find direct articles in my feeds, but here's a short summary of *{topic}* "
-            "based on general knowledge. I can keep watching and alert you to updates if you'd like.")
+        print("genai.generate_content() call failed:", e)
+    # fallback extractive
+    paragraphs = article_text.split("\n\n")
+    short = "\n\n".join(paragraphs[:2]).strip()
+    return f"(extract) {short}\n\nWant me to open the link for more?"
 
-# ---------------- intent heuristics (simpler + topic extraction) ----------------
-NEWS_INTENT_KEYWORDS = ["news","update","updates","latest","breaking","report","released","release","new","any updates"]
-GREETINGS_RE = re.compile(r"\b(hi|hello|hey|hiya|greetings)\b", re.I)
-
-def decide_need_news(user_message: str):
-    msg = (user_message or "").strip()
+# ---------------- Topic heuristics ----------------
+def extract_topic_from_message(msg: str) -> str:
     if not msg:
-        return False, None, ""
-    low = msg.lower()
-    # greeting-only detection: short + only greeting words
-    if len(msg) < 60 and GREETINGS_RE.search(msg) and not any(k in low for k in NEWS_INTENT_KEYWORDS) and len(re.sub(r"\b(hi|hello|hey|hiya|greetings)\b", "", low).strip()) < 2:
-        return False, "greeting", msg
-    if any(k in low for k in NEWS_INTENT_KEYWORDS):
-        topic = extract_topic_from_message(msg)
-        return True, None, topic
-    # If user explicitly asks about latest <topic> without keyword, still check 'about' patterns
-    topic_try = extract_topic_from_message(msg)
-    if topic_try and topic_try.lower() not in ("news","please") and len(topic_try) > 2:
-        return True, None, topic_try
-    return False, None, msg
+        return "news"
+    m = re.search(r"(?:about|on|regarding|regarding:|regarding\s)([^?.!]+)", msg, re.I)
+    if not m:
+        m = re.search(r"(?:news|latest|updates?)\s(?:about\s)?([^?.!]+)", msg, re.I)
+    if m:
+        topic = m.group(1).strip()
+        topic = re.sub(r"\b(today|please|now|for my project|for my|for)\b", "", topic, flags=re.I).strip()
+        return topic[:120].strip()
+    cleaned = re.sub(r"\b(hey|hi|hello|buddy|bro|please|can i|could you|i want|i'd like|i want to)\b", "", msg, flags=re.I).strip()
+    if cleaned and len(cleaned) < 140:
+        return cleaned
+    return "news"
 
-# ---------------- MAIN /chat endpoint ----------------
+def map_keyword_to_category(topic: str) -> Optional[str]:
+    for k, cat in KEYWORD_CATEGORY.items():
+        if k in topic.lower():
+            return cat
+    for cat in ["space", "tech", "business", "world", "sports", "entertainment"]:
+        if cat in topic.lower():
+            return cat
+    return None
+
+# ---------------- MAIN /chat endpoint implementing n8n flow ----------------
 @app.post("/chat")
 def chat(req: ChatReq):
     user_message = (req.message or "").strip()
@@ -532,152 +443,149 @@ def chat(req: ChatReq):
     email = (req.user_email or "").strip().lower() or None
     conv_name_in = (req.conversation_name or "").strip() or None
 
-    # decide news intent and extract a cleaner topic
-    need_news, special_flag, topic_text = decide_need_news(user_message)
-
-    # If conversation name provided -> append to that conversation (create if missing)
-    # If no conversation name provided -> create a new conversation for this chat (auto name)
-    if email:
-        ensure_user_row_sqlite(email)
-
-    # Prepare conversation name
+    # prepare conversation name
     if conv_name_in:
         conv_name = conv_name_in
     else:
-        if need_news:
-            # generate a short, human-friendly title via GenAI
-            try:
-                gen_title = generate_conversation_name(user_message)
-                conv_name = f"{gen_title}_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}"
-            except Exception:
-                base = re.sub(r"[^\w\s-]", "", topic_text)[:60].strip()
-                conv_name = f"{base or 'topic'}_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}"
-        else:
-            conv_name = f"chat_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:6]}"
+        conv_name = f"chat_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:6]}"
 
-    # Append user's message to conversation (sqlite)
+    # record user message
     if email:
+        ensure_user_row_sqlite(email)
         append_message_to_conversation(email, conv_name, email, user_message)
-        # also push to supabase if available
-        if supabase:
-            try:
-                supabase.table("users").upsert({"email": email, "chat_history": fetch_sqlite_chat_history(email)}).execute()
-            except Exception as e:
-                print("supabase upsert (after user message) error:", e)
 
-    # If greeting-only -> respond warmly and personally
-    if special_flag == "greeting":
-        reply = "Hello 👋 how are you? I'm Nova — your news + chat buddy. 😊 Ask me for news, a summary, or anything you'd like."
+    # check greeting
+    if re.match(r"^\s*(hi|hello|hey|hiya|yo|sup)\b", user_message, flags=re.I):
+        reply = "Hello 👋 how are you? I'm Nova — your news + chat buddy. Ask me for the latest on any topic (e.g., 'news about NASA')."
         if email:
             append_message_to_conversation(email, conv_name, "Nova", reply)
             if supabase:
-                try:
-                    supabase.table("users").upsert({"email": email, "chat_history": fetch_sqlite_chat_history(email)}).execute()
-                except Exception as e:
-                    print("supabase upsert (greet) error:", e)
+                supabase_upsert_user(email)
         return {"reply": reply, "conversation": conv_name}
 
-    # If not news, reply conversationally (chatty, not robotic)
-    if not need_news:
-        low = user_message.lower()
-        if any(g in low for g in ("help","suggest","what can you do","how can you")):
-            reply = ("Hey! I'm Nova — I can fetch and summarize news, save conversations with short titles, and keep watching topics for updates. "
-                     "Try: 'news about AI' or 'latest on NASA' or ask me to save this chat.")
-        else:
-            # friendly chat-style reply
-            reply = (f"Nice — {user_message}\n\nI'm here to chat like a buddy. Want me to look up news, summarize something, or save this conversation with a short name?")
+    # decide if user asked for news
+    low = user_message.lower()
+    news_keywords = ["news", "latest", "update", "updates", "breaking", "what's new", "any news", "tell me about"]
+    wants_news = any(k in low for k in news_keywords) or ("about " in low) or ("latest on" in low) or ("latest" in low and len(low) < 60)
 
+    if not wants_news:
+        # normal buddy-style response
+        reply = f"Nice — {user_message}\n\nI'm here to chat like a buddy. Want me to look up news, summarize something, or save this conversation with a short name?"
         if email:
             append_message_to_conversation(email, conv_name, "Nova", reply)
             if supabase:
-                try:
-                    supabase.table("users").upsert({"email": email, "chat_history": fetch_sqlite_chat_history(email)}).execute()
-                except Exception as e:
-                    print("supabase upsert (non-news reply) error:", e)
+                supabase_upsert_user(email)
         return {"reply": reply, "conversation": conv_name}
 
-    # --- need_news True: perform feed search using the extracted topic_text ---
-    # pick category from keywords if possible (so we prefer category feeds)
-    inferred_category = map_keyword_to_category(topic_text) or None
-    sheet_rows = fetch_sheet_rows(SHEET_ID, SHEET_GID) if SHEET_ID else []
-    articles = []
+    # --- User wants news: follow the n8n flow ---
+    topic = extract_topic_from_message(user_message)
+    inferred_category = map_keyword_to_category(topic)
 
-    # Use search_rss_for_topic which returns results and feeds checked
-    rss_found, feeds_checked = search_rss_for_topic(topic_text, max_items=40, category=inferred_category)
-
-    # Try sheet matches first
-    if sheet_rows:
+    # 1) Fetch chat history to avoid duplicates (supabase or sqlite)
+    user_hist = fetch_sqlite_chat_history(email) if email else []
+    sup_row = supabase_get_user(email) if supabase and email else None
+    if sup_row and isinstance(sup_row, dict) and sup_row.get("chat_history"):
         try:
-            for r in sheet_rows:
-                combined = " ".join([r.get("headline",""), r.get("news",""), r.get("categories",""), r.get("link","")]).lower()
-                if topic_text.lower() in combined:
-                    headline = r.get("headline") or r.get("title") or topic_text
-                    link = r.get("link") or ""
-                    article_text = r.get("news") or r.get("summary") or ""
-                    published = r.get("date") or None
-                    if link and not article_text:
-                        article_text = extract_article_text(link)
-                    articles.append({"headline": headline, "link": link, "article_text": article_text, "published": published, "source": "sheet"})
-                    if len(articles) >= MAX_RESULTS:
-                        break
-        except Exception as e:
-            print("sheet search err", e)
-
-    # Add RSS-found items
-    for item in rss_found:
-        if len(articles) >= MAX_RESULTS:
-            break
-        link = item.get("link")
-        headline = item.get("headline") or topic_text
-        article_text = extract_article_text(link) or item.get("summary") or ""
-        articles.append({"headline": headline, "link": link, "article_text": article_text, "published": item.get("published"), "source": "rss"})
-
-    # fallback: google news rss if nothing found
-    if not articles:
-        try:
-            q = requests.utils.quote(topic_text)
-            gurl = f"https://news.google.com/rss/search?q={q}"
-            feed = feedparser.parse(gurl)
-            for entry in feed.entries[:MAX_RESULTS]:
-                headline = entry.get("title")
-                link = entry.get("link")
-                article_text = extract_article_text(link) or entry.get("summary") or ""
-                articles.append({"headline": headline, "link": link, "article_text": article_text, "published": entry.get("published"), "source": "googlenews"})
-            # add google news to feeds_checked for transparency
-            feeds_checked = feeds_checked + [gurl]
+            save_sqlite_chat_history(email, sup_row.get("chat_history"))
+            user_hist = sup_row.get("chat_history")
         except Exception:
             pass
 
-    # If still none, produce a generative fallback summary (user should always get a reply)
-    if not articles:
-        summary_text = summarize_topic_fallback(topic_text, user_message)
-        chatty = f"Hey — I couldn't find fresh articles in the feeds I checked.\n\n{summary_text}\n\n— Nova"
+    # 2) Check Google Sheets cache for this topic (if configured)
+    sheet_rows = fetch_sheet_rows(SHEET_ID, SHEET_GID) if SHEET_ID else []
+    cached_matches = []
+    cutoff_dt = datetime.utcnow() - timedelta(hours=CACHE_MAX_AGE_HOURS)
+    try:
+        for r in sheet_rows:
+            cat = r.get("category", "")
+            title = r.get("title", "")
+            summary = r.get("summary", "")
+            link = r.get("link", "")
+            published = r.get("published_date") or r.get("published") or ""
+            fetched = r.get("fetched_at") or ""
+            if topic.lower() in (title + " " + summary + " " + cat).lower() or (inferred_category and inferred_category == cat):
+                fresh = False
+                if fetched:
+                    try:
+                        fdt = dateparser.parse(fetched)
+                        if fdt.tzinfo is None:
+                            fdt = fdt.replace(tzinfo=timezone.utc)
+                        if fdt >= cutoff_dt:
+                            fresh = True
+                    except Exception:
+                        fresh = True
+                else:
+                    if published:
+                        try:
+                            pdt = dateparser.parse(published)
+                            if pdt.tzinfo is None:
+                                pdt = pdt.replace(tzinfo=timezone.utc)
+                            if pdt >= cutoff_dt:
+                                fresh = True
+                        except Exception:
+                            fresh = True
+                if fresh:
+                    cached_matches.append({"title": title, "summary": summary, "link": link, "source": r.get("source", ""), "published": published})
+    except Exception as e:
+        print("sheet cache parse err", e)
+
+    # If we have fresh cached results, return up to MAX_RESULTS
+    if cached_matches:
+        top = cached_matches[:MAX_RESULTS]
+        parts = []
+        for i, it in enumerate(top, start=1):
+            parts.append(f"{i}. {it['title']}\n\n{it['summary']}\n\nSource: {it.get('source') or 'unknown'} | Link: {it.get('link')}\n")
+        chatty = f"Hey — I looked in your cached news and found these for *{topic}*:\n\n" + "\n".join(parts) + "\nWould you like the full article text for any item?"
         if email:
             append_message_to_conversation(email, conv_name, "Nova", chatty)
             if supabase:
-                try:
-                    supabase.table("users").upsert({"email": email, "chat_history": fetch_sqlite_chat_history(email)}).execute()
-                except Exception as e:
-                    print("supabase upsert (fallback) error:", e)
-        return {"reply": chatty, "count": 0, "conversation": conv_name}
+                supabase_upsert_user(email)
+        return {"reply": chatty, "count": len(top), "conversation": conv_name}
 
-    # Summarize found articles
+    # 3) No fresh cached news -> fetch from RSS (preferring category feeds)
+    rss_items, feeds_checked = search_rss_for_topic(topic, user_email=email, max_items=40, category=inferred_category)
+    # dedupe by link/title
+    seen = set()
+    deduped = []
+    for it in rss_items:
+        link = it.get("link") or ""
+        title = it.get("headline") or ""
+        key = (link or title).strip()
+        if key and key not in seen:
+            seen.add(key)
+            deduped.append(it)
+    # take top MAX_RESULTS
+    results = deduped[:MAX_RESULTS]
+
+    # For each found result, try to extract article text then summarize
     summaries = []
-    for art in articles[:MAX_RESULTS]:
-        if not art.get("article_text"):
-            summaries.append({
-                "headline": art.get("headline"),
-                "link": art.get("link"),
-                "summary": f"❗️ Couldn't extract text from the link. Link: {art.get('link')}",
-                "source": art.get("source")
-            })
-            continue
-        summary_text = summarize_article(art["article_text"], art.get("headline", topic_text), user_message)
-        summaries.append({"headline": art.get("headline"), "link": art.get("link"), "summary": summary_text, "source": art.get("source"), "published": art.get("published")})
+    new_rows_for_sheet = []
+    for it in results:
+        headline = it.get("headline") or ""
+        link = it.get("link") or ""
+        article_text = extract_article_text(link) or it.get("summary") or ""
+        published = it.get("published") or ""
+        source_feed = it.get("source_feed") or ""
+        if article_text:
+            summary_text = summarize_article_with_gemini(article_text, headline, user_message)
+        else:
+            summary_text = it.get("summary") or "(no extractable text) " + (link or "")
+        summaries.append({"headline": headline, "summary": summary_text, "link": link, "published": published, "source": source_feed})
+        fetched_at = datetime.utcnow().isoformat()+"Z"
+        new_rows_for_sheet.append([email or "anonymous", topic, headline, summary_text[:800], link, published, fetched_at, source_feed])
 
-    # Build a friendly chat-style reply — mention a few sources (domain names) we checked
-    short_topic = topic_text if len(topic_text) < 80 else topic_text[:80] + "..."
-    # get domains (unique) for friendly mention
+    # 4) Write-back: append new items to Google Sheet (if available) and update Supabase chat_history
+    append_ok = False
+    if gspread_client and SHEET_ID and new_rows_for_sheet:
+        try:
+            for row in new_rows_for_sheet:
+                append_row_to_sheet(SHEET_ID, row)
+            append_ok = True
+        except Exception as e:
+            print("sheet append failed:", e)
+            append_ok = False
+
+    # Update supabase chat history with the reply text (so we avoid repeating)
     domains = []
     for f in feeds_checked:
         try:
@@ -686,122 +594,26 @@ def chat(req: ChatReq):
                 domains.append(d)
         except Exception:
             pass
-    # limit the list to 5 domains for brevity
     domains_display = ", ".join(domains[:5]) if domains else "multiple sources"
-    blocks = []
-    for i, s in enumerate(summaries, start=1):
-        blocks.append(f"{i}. {s.get('headline')}\n\n{s.get('summary')}\n\nLink: {s.get('link')}")
-    combined_reply = "\n\n---\n\n".join(blocks)
-    suggestions = ("\n\nIf you want, reply with the article number to read more (e.g. '1'), "
-                   "or say 'watch' to create an alert for this topic.\n")
-    chatty = (f"Hey! I checked {domains_display} and found a few recent stories about {short_topic}:\n\n"
-             f"{combined_reply}\n\n{suggestions}\n— Nova")
 
-    # Append Nova reply to conversation + supabase upsert
+    # format final friendly reply
+    if summaries:
+        parts = []
+        for i, s in enumerate(summaries, start=1):
+            parts.append(f"{i}. {s['headline']}\n\n{s['summary']}\n\nLink: {s['link']}\n")
+        combined_reply = f"Hey! I checked {domains_display} and found these for *{topic}*:\n\n" + "\n".join(parts) + "\nDo you want the full article for any item (reply with the number)?"
+    else:
+        combined_reply = f"Hey — I couldn't find anything fresh about *{topic}* in the feeds I checked. Want me to broaden the search?"
+
     if email:
-        append_message_to_conversation(email, conv_name, "Nova", chatty)
+        append_message_to_conversation(email, conv_name, "Nova", combined_reply)
         if supabase:
-            try:
-                supabase.table("users").upsert({"email": email, "chat_history": fetch_sqlite_chat_history(email)}).execute()
-            except Exception as e:
-                print("supabase upsert (news reply) error:", e)
+            supabase_upsert_user(email)
 
-    return {"reply": chatty, "count": len(summaries), "conversation": conv_name}
+    return {"reply": combined_reply, "count": len(summaries), "conversation": conv_name, "sheet_append_ok": append_ok}
 
-# ---------------- get a single conversation ----------------
-@app.post("/get_chat")
-def get_chat(req: GetChatReq):
-    email = (req.email or "").strip().lower()
-    conv_name = (req.conversation_name or "").strip()
-    if not email:
-        raise HTTPException(status_code=400, detail="email required")
-    if not conv_name:
-        raise HTTPException(status_code=400, detail="conversation_name required")
-    hist = fetch_sqlite_chat_history(email)
-    for obj in hist:
-        if isinstance(obj, dict) and conv_name in obj:
-            return {conv_name: obj[conv_name]}
-    # fallback supabase
-    if supabase:
-        try:
-            r = supabase.table("users").select("chat_history").eq("email", email).single().execute()
-            data = getattr(r, "data", None) or (r.get("data") if isinstance(r, dict) else None)
-            hist_s = data.get("chat_history", []) if data else []
-            for obj in hist_s:
-                if isinstance(obj, dict) and conv_name in obj:
-                    return {conv_name: obj[conv_name]}
-        except Exception as e:
-            print("get_chat supabase error:", e)
-    raise HTTPException(status_code=404, detail=f"Conversation '{conv_name}' not found for {email}.")
-
-# ---------------- append explicit ----------------
-@app.post("/append_chat")
-def append_chat(req: AppendReq):
-    email = (req.user_email or "").strip().lower()
-    conv = (req.conversation_name or "").strip()
-    sender = (req.sender or "").strip()
-    text = (req.text or "").strip()
-    if not email or not conv or not sender or not text:
-        raise HTTPException(status_code=400, detail="email, conversation_name, sender, text required")
-    append_message_to_conversation(email, conv, sender, text)
-    if supabase:
-        try:
-            supabase.table("users").upsert({"email": email, "chat_history": fetch_sqlite_chat_history(email)}).execute()
-        except Exception as e:
-            print("append supabase error:", e)
-    return {"ok": True, "message": "Appended message to conversation."}
-
-# ---------------- list chats ----------------
-@app.get("/list_chats")
-def list_chats(email: Optional[str] = None):
-    if not email:
-        raise HTTPException(status_code=400, detail="email query param required")
-    email = email.strip().lower()
-    hist = fetch_sqlite_chat_history(email)
-    names = []
-    for obj in hist:
-        if isinstance(obj, dict):
-            names.extend(list(obj.keys()))
-    return {"count": len(names), "conversations": names}
-
-# ---------------- rename ----------------
-@app.post("/rename_chat")
-def rename_chat(req: RenameReq):
-    email = (req.user_email or "").strip().lower()
-    old = (req.old_name or "").strip()
-    new = (req.new_name or "").strip()
-    if not email or not old or not new:
-        raise HTTPException(status_code=400, detail="user_email, old_name, new_name required")
-    renamed = rename_sqlite_conversation(email, old, new)
-    if supabase:
-        try:
-            hist = fetch_sqlite_chat_history(email)
-            supabase.table("users").upsert({"email": email, "chat_history": hist}).execute()
-        except Exception as e:
-            print("rename supabase error:", e)
-    if renamed:
-        return {"ok": True, "message": f"Conversation renamed from '{old}' to '{new}' for {email}."}
-    return {"ok": False, "message": f"Conversation '{old}' not found for {email}."}
-
-# ---------------- delete ----------------
-@app.post("/delete_chat")
-def delete_chat(req: DeleteReq):
-    email = (req.user_email or "").strip().lower()
-    conv = (req.conversation_name or "").strip()
-    if not email or not conv:
-        raise HTTPException(status_code=400, detail="user_email and conversation_name required")
-    removed = delete_sqlite_conversation(email, conv)
-    if supabase:
-        try:
-            hist = fetch_sqlite_chat_history(email)
-            supabase.table("users").upsert({"email": email, "chat_history": hist}).execute()
-        except Exception as e:
-            print("delete supabase error:", e)
-    if removed:
-        return {"ok": True, "message": f"Conversation '{conv}' deleted for {email}."}
-    return {"ok": False, "message": f"Conversation '{conv}' not found for {email}."}
-
-# ---------------- health ----------------
+# ---------------- simple health ----------------
 @app.get("/health")
 def health():
     return {"ok": True, "time": datetime.utcnow().isoformat()+"Z"}
+    
