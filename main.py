@@ -447,9 +447,9 @@ def chat(req: ChatReq):
     if conv_name_in:
         conv_name = conv_name_in
     else:
-        conv_name = f"chat_{datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')}_{uuid.uuid4().hex[:6]}"
-
-    # record user message
+        # simple short string name generated from the user's message
+        base_name = re.sub(r'[^A-Za-z0-9 _-]', '', extract_topic_from_message(user_message)).strip()
+        conv_name = base_name or f"chat_{uuid.uuid4().hex[:6]}"
     if email:
         ensure_user_row_sqlite(email)
         append_message_to_conversation(email, conv_name, email, user_message)
