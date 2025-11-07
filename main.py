@@ -177,52 +177,185 @@ class ChatReq(BaseModel):
 # ---------------- Endpoint ----------------
 @app.post("/chat")
 def chat(req: ChatReq):
-    email = req.user_email.strip().lower()
-    msg = req.message.strip()
-    conv_name = req.conversation_name
+    """
+    Hardened chat endpoint:
+    - wraps entire logic in try/except so FastAPI always returns valid JSON
+    - logs exceptions to server stdout for debugging
+    - uses fallbacks when external tools fail
+    """
+    try:
+        email = (req.user_email or "").strip().lower() or None
+        user_message = (req.message or "").strip()
+        conv_name_in = (req.conversation_name or "").strip() or None
 
-    if not msg:
-        raise HTTPException(status_code=400, detail="Message required")
+        if not user_message:
+            return {"reply": "Please send a message.", "conversation": conv_name_in or "chat_unknown"}
 
-    # handle greeting
-    if re.match(r"^(hi|hello|hey)\b", msg, re.I):
-        conv = conv_name or make_conv_name_from_message(msg)
-        reply = "Hello 👋 how are you? I'm Nova — your friendly AI news assistant. Want to know what's new today?"
-        append_message(email, conv, email, msg)
-        append_message(email, conv, "Nova", reply)
-        return {"reply": reply, "conversation": conv}
+        # helper: sanitize conversation name
+        def sanitize_conv_name(name: Optional[str]) -> Optional[str]:
+            if not name:
+                return None
+            s = re.sub(r"[^A-Za-z0-9 _-]", "", name).strip()
+            s = re.sub(r"\s+", " ", s)
+            return s[:120] if s else None
 
-    # if no conversation name provided
-    if not conv_name:
-        # detect if this is a "yes"/"continue" type follow-up
-        if re.match(r"^(yes|yeah|yep|continue|go on|sure)\b", msg, re.I):
-            last_conv = get_last_conversation(email)
-            conv_name = last_conv or make_conv_name_from_message(msg)
+        # create / reuse conversation name
+        if conv_name_in:
+            conv_name = sanitize_conv_name(conv_name_in)
         else:
-            conv_name = make_conv_name_from_message(msg)
+            # if the user wrote a short 'yes' or follow-up, attach to last conversation
+            if re.match(r"^(yes|yeah|yep|sure|continue|go on|ok)\b", user_message, flags=re.I) and email:
+                last = get_last_conversation(email)
+                conv_name = last or sanitize_conv_name(make_conv_name_from_message(user_message)) or f"chat_{uuid.uuid4().hex[:6]}"
+            else:
+                conv_name = sanitize_conv_name(make_conv_name_from_message(user_message)) or f"chat_{uuid.uuid4().hex[:6]}"
 
-    append_message(email, conv_name, email, msg)
+        # ensure user row exists and append user message right away
+        if email:
+            try:
+                ensure_user_row_sqlite(email)
+            except Exception as e:
+                print("ensure_user_row_sqlite error:", e)
+            try:
+                append_message_to_conversation(email, conv_name, email, user_message)
+            except Exception as e:
+                print("append user message error:", e)
 
-    # detect news intent
-    if any(k in msg.lower() for k in ["news", "update", "latest", "about"]):
-        topic = extract_topic(msg)
-        articles = fetch_rss(topic, email)
-        if not articles:
-            reply = f"I couldn't find anything fresh about {topic}. Want me to broaden the search?"
-            append_message(email, conv_name, "Nova", reply)
+        # Quick greeting branch
+        if re.match(r"^\s*(hi|hello|hey|hiya|yo)\b", user_message, flags=re.I):
+            reply = "Hello 👋 how are you? I'm Nova — your friendly news buddy. Want the latest on something?"
+            # persist reply
+            if email:
+                try:
+                    append_message_to_conversation(email, conv_name, "Nova", reply)
+                    if supabase:
+                        supabase_upsert_user(email)
+                except Exception as e:
+                    print("append greeting reply error:", e)
             return {"reply": reply, "conversation": conv_name}
-        summaries = []
-        for art in articles:
-            text = summarize(art["summary"], art["title"], msg)
-            summaries.append(f"📰 *{art['title']}*\n{text}\n🔗 {art['link']}")
-        reply = "\n\n".join(summaries) + "\n\nWould you like me to summarize one in detail?"
-        append_message(email, conv_name, "Nova", reply)
-        return {"reply": reply, "conversation": conv_name}
 
-    # casual chat fallback
-    reply = f"Got it — {msg}. Want me to check latest news or something else?"
-    append_message(email, conv_name, "Nova", reply)
-    return {"reply": reply, "conversation": conv_name}
+        # Decide if news intent
+        low = user_message.lower()
+        is_news = any(k in low for k in ["news", "latest", "update", "about", "breaking"])
+
+        if not is_news:
+            # friendly chat fallback
+            reply = f"Nice — {user_message}. Want me to check the latest news or summarize something?"
+            if email:
+                try:
+                    append_message_to_conversation(email, conv_name, "Nova", reply)
+                    if supabase:
+                        supabase_upsert_user(email)
+                except Exception as e:
+                    print("append fallback reply error:", e)
+            return {"reply": reply, "conversation": conv_name}
+
+        # --- NEWS path ---
+        # extract topic and attempt cache -> rss -> fallback
+        try:
+            topic = extract_topic_from_message(user_message) if 'extract_topic_from_message' in globals() else extract_topic(user_message)
+        except Exception:
+            topic = user_message[:80]
+
+        # try cached sheet first
+        articles = []
+        try:
+            sheet_rows = fetch_sheet_rows(SHEET_ID, SHEET_GID) if SHEET_ID else []
+            # simple matching to get cached results
+            for r in sheet_rows:
+                title = r.get("title", "")
+                summary = r.get("summary", "")
+                link = r.get("link", "")
+                cat = r.get("category", "") or ""
+                if topic.lower() in (title + " " + summary + " " + cat).lower():
+                    articles.append({"headline": title or "Untitled", "link": link, "article_text": summary, "source": r.get("source") or "sheet"})
+                    if len(articles) >= MAX_RESULTS:
+                        break
+        except Exception as e:
+            print("sheet read error:", e)
+
+        # if no cached articles, search RSS
+        if not articles:
+            try:
+                rss_found, feeds_checked = search_rss_for_topic(topic, user_email=email, max_items=40, category=map_keyword_to_category(topic))
+                for item in rss_found[:MAX_RESULTS]:
+                    link = item.get("link")
+                    headline = item.get("headline") or topic
+                    article_text = None
+                    try:
+                        article_text = extract_article_text(link)
+                    except Exception as e:
+                        print("extract_article_text error for link", link, e)
+                    if not article_text:
+                        article_text = item.get("summary") or ""
+                    articles.append({"headline": headline, "link": link, "article_text": article_text, "source": item.get("source_feed") or "rss"})
+            except Exception as e:
+                print("rss fetch error:", e)
+
+        # Last fallback: no articles found -> generative topic summary
+        if not articles:
+            try:
+                summary_text = summarize_topic_fallback(topic, user_message) if 'summarize_topic_fallback' in globals() else f"I couldn't find recent articles for {topic}."
+            except Exception as e:
+                print("fallback summarizer error:", e)
+                summary_text = f"I couldn't find recent articles for {topic}."
+            reply = f"Hey — {summary_text}\n\nWould you like me to broaden the search?"
+            if email:
+                try:
+                    append_message_to_conversation(email, conv_name, "Nova", reply)
+                    if supabase:
+                        supabase_upsert_user(email)
+                except Exception as e:
+                    print("append fallback reply error2:", e)
+            return {"reply": reply, "conversation": conv_name, "count": 0}
+
+        # Summarize each article robustly (gemini calls wrapped)
+        summaries = []
+        for art in articles[:MAX_RESULTS]:
+            try:
+                if art.get("article_text"):
+                    summary_text = summarize_article_with_gemini(art["article_text"], art.get("headline", topic), user_message) if 'summarize_article_with_gemini' in globals() else art.get("article_text")[:300]
+                else:
+                    summary_text = art.get("summary") or "(no extractable text)"
+            except Exception as e:
+                print("summarization error:", e)
+                summary_text = art.get("summary") or "(summary failed)"
+            # safe string build
+            headline = art.get("headline") or "Untitled"
+            link = art.get("link") or ""
+            summaries.append({"headline": headline, "summary": summary_text, "link": link, "source": art.get("source")})
+
+        # Build friendly chat reply text
+        try:
+            sd_blocks = []
+            for i, s in enumerate(summaries, start=1):
+                # ensure all are strings
+                h = str(s.get("headline", ""))
+                sm = str(s.get("summary", ""))
+                lk = str(s.get("link", ""))
+                sd_blocks.append(f"{i}. {h}\n\n{sm}\n\nLink: {lk}")
+            combined_reply = "Hey! I found these:\n\n" + "\n\n---\n\n".join(sd_blocks) + "\n\nReply with a number to read more or 'watch' to follow this topic.\n— Nova"
+        except Exception as e:
+            print("reply-build error:", e)
+            combined_reply = "I found some items but couldn't format them — try again."
+
+        # persist Nova's reply
+        if email:
+            try:
+                append_message_to_conversation(email, conv_name, "Nova", combined_reply)
+                if supabase:
+                    supabase_upsert_user(email)
+            except Exception as e:
+                print("append nova reply error:", e)
+
+        return {"reply": combined_reply, "conversation": conv_name, "count": len(summaries)}
+
+    except Exception as e:
+        # last-resort catch-all: log and return friendly error message
+        print("Unhandled /chat error:", e, flush=True)
+        traceback.print_exc()
+        # safe fallback response (always JSON)
+        return {"reply": "Sorry — I hit an unexpected error while processing your message. Please try again or check server logs.", "conversation": conv_name_in or "chat_error"}
 
 @app.get("/health")
 def health():
