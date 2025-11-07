@@ -1,10 +1,9 @@
 fastapi
 uvicorn[standard]
 requests
-feedparser
 beautifulsoup4
+feedparser
 google-generativeai
 python-dateutil
 pydantic
 supabase
-python-dotenv
