@@ -5,3 +5,4 @@ supabase
 feedparser
 requests
 beautifulsoup4
+dateutil
