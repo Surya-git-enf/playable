@@ -114,7 +114,7 @@ def list_chats_get(email: Optional[str] = None):
         raise HTTPException(status_code=400, detail="Missing email query param")
     history = get_history(email)
     names = [list(conv.keys())[0] for conv in history if isinstance(conv, dict)]
-    return {"conversations": names, "count": len(names), "chat_history": history}
+    return {"conversations": names[::-1], "count": len(names), "chat_history": history}
 
 @app.post("/list_chats")
 async def list_chats_post(request: Request):
@@ -124,7 +124,7 @@ async def list_chats_post(request: Request):
         raise HTTPException(status_code=400, detail="Missing email")
     history = get_history(email)
     names = [list(conv.keys())[0] for conv in history if isinstance(conv, dict)]
-    return {"conversations": names[::0], "count": len(names), "chat_history": history}
+    return {"conversations": names[::-1], "count": len(names), "chat_history": history}
 
 # GET conversation (POST body: { email|user_email, conversation_name })
 @app.post("/get_chat")
