@@ -1,227 +1,143 @@
-# app.py (FastAPI) — replace your current file with this
-from fastapi import FastAPI, HTTPException, Request
-from pydantic import BaseModel
-from datetime import datetime
-from typing import Optional, List, Dict, Any
-import json, traceback, os
+# main.py
+import os
+import shutil
+import uuid
+import zipfile
+import asyncio
+from pathlib import Path
+from typing import Optional
+from fastapi import FastAPI, BackgroundTasks, HTTPException, Request
+from fastapi.responses import JSONResponse
+import httpx
 
-# ---------- Supabase ----------
-try:
-    from supabase import create_client
-except Exception:
-    create_client = None
+# CONFIG (set these as Render environment variables)
+UNITY_API_BASE = os.environ.get("UNITY_API_BASE", "https://build-api.cloud.unity3d.com/api/v1")
+UNITY_ORG = os.environ.get("UNITY_ORG")           # e.g. org GUID
+UNITY_PROJECT = os.environ.get("UNITY_PROJECT")   # e.g. project GUID
+UNITY_BASIC_AUTH = os.environ.get("UNITY_BASIC_AUTH")  # "Basic base64(id:secret)" or "Bearer ..."
+# Where to store artifacts temporarily on the Render service
+WORKDIR = os.environ.get("WORKDIR", "/tmp/unity_builds")
+ARTIFACTS_DIR = os.path.join(WORKDIR, "artifacts")
+os.makedirs(ARTIFACTS_DIR, exist_ok=True)
 
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
-SUPABASE_KEY = os.getenv("SUPABASE_KEY", "").strip()
+app = FastAPI(title="Unity Cloud Build Proxy for Render")
 
-if not SUPABASE_URL or not SUPABASE_KEY or not create_client:
-    raise RuntimeError("Supabase credentials missing in environment variables!")
+client = httpx.AsyncClient(timeout=120.0)
 
-supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
+def unity_auth_headers():
+    if UNITY_BASIC_AUTH:
+        return {"Authorization": UNITY_BASIC_AUTH}
+    raise RuntimeError("Set UNITY_BASIC_AUTH env var on Render")
 
-app = FastAPI(title="Nova — Chat History Manager (compatible endpoints)")
+# 1) Trigger a Unity Cloud Build for an existing build target.
+@app.post("/trigger_build")
+async def trigger_build(build_target_id: str, clean: Optional[bool] = True):
+    """
+    Request body (form/query):
+      build_target_id: the Unity Cloud Build build target ID (GUID)
+    Returns: build-request metadata (Unity response)
+    """
+    if not UNITY_ORG or not UNITY_PROJECT:
+        raise HTTPException(status_code=500, detail="UNITY_ORG or UNITY_PROJECT not configured as env vars")
 
-# ---------- Helpers ----------
-def get_history_raw_row(email: str):
-    """Return raw data row or None"""
+    url = f"{UNITY_API_BASE}/orgs/{UNITY_ORG}/projects/{UNITY_PROJECT}/buildtargets/{build_target_id}/builds"
+    payload = {"clean": bool(clean)}
+    headers = unity_auth_headers()
+    headers["Content-Type"] = "application/json"
+    resp = await client.post(url, headers=headers, json=payload)
+    if resp.status_code >= 400:
+        raise HTTPException(status_code=502, detail={"unity_status": resp.status_code, "body": resp.text})
+    data = resp.json()
+    return JSONResponse({"status": "started", "unity": data})
+
+# 2) Webhook endpoint for Unity Cloud Build to POST when build finishes
+@app.post("/unity_webhook")
+async def unity_webhook(request: Request, background: BackgroundTasks):
+    """
+    Unity will POST build events to this endpoint (configure in Cloud Build).
+    The payload contains build status and artifact URL(s).
+    We will verify (optionally) and if success, download the build artifact in background.
+    """
+    payload = await request.json()
+    # IMPORTANT: verify webhook signature / token if Unity provides it (not implemented here)
+    build_status = payload.get("buildStatus") or payload.get("status")
+    build_target = payload.get("buildTarget") or payload.get("buildTargetId")
+    build_id = payload.get("buildId") or payload.get("buildNumber") or str(uuid.uuid4())
+
+    # If build succeeded, download artifact in background
+    if str(build_status).lower() in ("success", "finished", "succeeded"):
+        artifact_url = None
+        # Unity Cloud Build typically returns an "links" or "artifacts" list — adapt to actual shape:
+        if "links" in payload and isinstance(payload["links"], list):
+            for link in payload["links"]:
+                if link.get("rel") == "download":
+                    artifact_url = link.get("href")
+                    break
+        # fallback: payload['artifactUrl'] etc
+        artifact_url = artifact_url or payload.get("artifactUrl") or payload.get("downloadUrl")
+        if artifact_url:
+            # spawn background download + deployment
+            background.add_task(download_and_publish, artifact_url, build_target, build_id)
+        return JSONResponse({"received": True, "will_download": bool(artifact_url)})
+    else:
+        # build failed or in progress — log or store status
+        return JSONResponse({"received": True, "status": build_status})
+
+async def download_and_publish(artifact_url: str, build_target: str, build_id: str):
+    """
+    Downloads the Unity Cloud Build artifact (zip), unpacks and publishes.
+    For testing: we store under ARTIFACTS_DIR/<build_id>/ and expose static files.
+    For production: upload to S3 / push to static hosting (recommended).
+    """
+    outdir = Path(ARTIFACTS_DIR) / f"{build_target}_{build_id}"
+    if outdir.exists():
+        shutil.rmtree(outdir)
+    outdir.mkdir(parents=True, exist_ok=True)
+
+    # Download zip
+    async with client.stream("GET", artifact_url, headers=unity_auth_headers()) as r:
+        if r.status_code >= 400:
+            # log error
+            return
+        temp_zip = outdir / "artifact.zip"
+        with open(temp_zip, "wb") as f:
+            async for chunk in r.aiter_bytes():
+                f.write(chunk)
+
+    # Unzip
     try:
-        res = supabase.table("users").select("chat_history").eq("email", email).execute()
-        if not res or not hasattr(res, "data") or not res.data:
-            return None
-        return res.data[0]
-    except Exception as e:
-        print("get_history_raw_row error:", e)
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Error fetching chat history")
+        with zipfile.ZipFile(temp_zip, "r") as z:
+            z.extractall(outdir)
+    except Exception:
+        # maybe artifact is already a folder — try nothing
+        pass
 
-def get_history(email: str) -> List[dict]:
-    """Fetch chat_history JSONB[] for given user."""
-    try:
-        row = get_history_raw_row(email)
-        if not row:
-            return []
-        data = row.get("chat_history") or []
-        if not data:
-            return []
-        # Parse any stringified JSON
-        parsed = []
-        for d in data:
-            if isinstance(d, str):
-                try:
-                    parsed.append(json.loads(d))
-                except Exception:
-                    continue
-            elif isinstance(d, dict):
-                parsed.append(d)
-        return parsed
-    except HTTPException:
-        raise
-    except Exception as e:
-        print("get_history error:", e)
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Error fetching chat history")
+    # At this point you have extracted WebGL build files (index.html, .mem, .wasm etc)
+    # Next: publish to static host.
+    # OPTION A (fast test): leave files under ARTIFACTS_DIR and serve via endpoint /static/<name>/index.html
+    # OPTION B (recommended): upload files to S3 or push to a static site repo (not implemented here)
+    return
 
-def save_history(email: str, history: List[dict]):
-    """Save updated chat_history to Supabase."""
-    try:
-        supabase.table("users").update({"chat_history": history}).eq("email", email).execute()
-        return True
-    except Exception as e:
-        print("save_history error:", e)
-        traceback.print_exc()
-        raise HTTPException(status_code=500, detail="Error saving chat history")
+# 3) List artifacts (simple)
+@app.get("/artifacts")
+def list_artifacts():
+    items = []
+    for p in Path(ARTIFACTS_DIR).iterdir():
+        if p.is_dir():
+            items.append(str(p.name))
+    return {"artifacts": items}
 
-def extract_email_from_payload(body: dict, query_email: Optional[str]=None) -> Optional[str]:
-    if not body:
-        return query_email
-    return body.get('email') or body.get('user_email') or query_email
+# 4) Get play URL (convenience)
+@app.get("/play/{artifact_name}")
+def play(artifact_name: str):
+    # Render static file URL — if using Render static site you would publish elsewhere
+    file_index = Path(ARTIFACTS_DIR) / artifact_name / "index.html"
+    if not file_index.exists():
+        raise HTTPException(status_code=404, detail="artifact not found")
+    # Serve via Render by returning a direct path that Render's static server is configured for,
+    # or implement a StaticFiles mount (see below). For now return a path relative to service.
+    return {"play_url": f"/static_artifacts/{artifact_name}/index.html"}
 
-def merge_element_into_history(history: List[dict], element: dict) -> List[dict]:
-    """
-    element example: { "conv_name": { "messages":[ { "User": "hi" } ] } }
-    If conv exists, append messages; else add new conv object.
-    """
-    if not isinstance(element, dict):
-        return history
-    # For each top-level key in element, merge its messages into history
-    for conv_name, conv_obj in element.items():
-        incoming_msgs = conv_obj.get("messages", []) if isinstance(conv_obj, dict) else []
-        found = False
-        for h in history:
-            if conv_name in h:
-                # ensure list exists
-                if "messages" not in h[conv_name] or not isinstance(h[conv_name]["messages"], list):
-                    h[conv_name]["messages"] = []
-                # append each message (keep it as object)
-                h[conv_name]["messages"].extend(incoming_msgs)
-                found = True
-                break
-        if not found:
-            # append as new conversation object
-            history.append({ conv_name: { "messages": list(incoming_msgs) } })
-    return history
-
-# ---------- Endpoints ----------
-
-@app.get("/")
-def root():
-    return {"message": "Nova Supabase Chat History API 💬"}
-
-# LIST: support GET?email= and POST { email | user_email }
-@app.get("/list_chats")
-def list_chats_get(email: Optional[str] = None):
-    if not email:
-        raise HTTPException(status_code=400, detail="Missing email query param")
-    history = get_history(email)
-    names = [list(conv.keys())[0] for conv in history if isinstance(conv, dict)]
-    return {"conversations": names[::-1], "count": len(names), "chat_history": history}
-
-@app.post("/list_chats")
-async def list_chats_post(request: Request):
-    body = await request.json()
-    email = extract_email_from_payload(body)
-    if not email:
-        raise HTTPException(status_code=400, detail="Missing email")
-    history = get_history(email)
-    names = [list(conv.keys())[0] for conv in history if isinstance(conv, dict)]
-    return {"conversations": names[::-1], "count": len(names), "chat_history": history}
-
-# GET conversation (POST body: { email|user_email, conversation_name })
-@app.post("/get_chat")
-async def get_chat(request: Request):
-    body = await request.json()
-    email = extract_email_from_payload(body)
-    conv_name = body.get("conversation_name") or body.get("conversationName") or body.get("conversation") or body.get("name")
-    if not email or not conv_name:
-        raise HTTPException(status_code=400, detail="Missing email or conversation_name")
-    history = get_history(email)
-    for conv in history:
-        if conv_name in conv:
-            return {conv_name: conv[conv_name]}
-    raise HTTPException(status_code=404, detail="Conversation not found")
-
-# APPEND: accept either "element_json_string" (frontend) or simple fields (sender/message)
-@app.post("/append_chat")
-async def append_chat(request: Request):
-    """
-    Accepts:
-    - { user_email | email, conversation_name, element_json_string } (frontend default)
-    OR
-    - { email, conversation_name, sender, message } (older format)
-    """
-    body = await request.json()
-    email = extract_email_from_payload(body)
-    conv_name = body.get("conversation_name") or body.get("conversationName") or body.get("conversation")
-    if not email or not conv_name:
-        raise HTTPException(status_code=400, detail="Missing email or conversation_name")
-
-    history = get_history(email)
-    # Path A: element_json_string (stringified JSON)
-    if "element_json_string" in body and body["element_json_string"]:
-        try:
-            element = json.loads(body["element_json_string"])
-            history = merge_element_into_history(history, element)
-            save_history(email, history)
-            return {"ok": True, "message": "Appended (element_json_string)", "chat_history": history}
-        except Exception as e:
-            print("append_chat parse element error", e)
-            traceback.print_exc()
-            raise HTTPException(status_code=400, detail="Invalid element_json_string")
-    # Path B: sender/message form
-    sender = body.get("sender") or body.get("from") or body.get("user")
-    message = body.get("message") or body.get("text") or body.get("content")
-    if sender is None or message is None:
-        raise HTTPException(status_code=400, detail="Missing message or sender")
-    # build element and merge
-    element = { conv_name: { "messages": [ { sender: message } ] } }
-    history = merge_element_into_history(history, element)
-    save_history(email, history)
-    return {"ok": True, "message": "Appended (sender/message)", "chat_history": history}
-
-# For compatibility: keep /append_message as well
-@app.post("/append_message")
-async def append_message(request: Request):
-    body = await request.json()
-    # this is the older "AppendReq" shape (email, conversation_name, sender, message)
-    return await append_chat(request)
-
-# RENAME: accepts user_email or email
-@app.post("/rename_chat")
-async def rename_chat(request: Request):
-    body = await request.json()
-    email = extract_email_from_payload(body)
-    old_name = body.get("old_name") or body.get("oldName")
-    new_name = body.get("new_name") or body.get("newName")
-    if not email or not old_name or not new_name:
-        raise HTTPException(status_code=400, detail="Missing parameters")
-    history = get_history(email)
-    renamed = False
-    for i, conv in enumerate(history):
-        if old_name in conv:
-            # preserve messages
-            history[i] = { new_name: conv[old_name] }
-            renamed = True
-            break
-    if not renamed:
-        raise HTTPException(status_code=404, detail="Conversation not found")
-    save_history(email, history)
-    return {"ok": True, "message": f"Renamed '{old_name}' to '{new_name}'", "chat_history": history}
-
-# DELETE: accepts user_email or email
-@app.post("/delete_chat")
-async def delete_chat(request: Request):
-    body = await request.json()
-    email = extract_email_from_payload(body)
-    conv_name = body.get("conversation_name") or body.get("conversationName") or body.get("conversation")
-    if not email or not conv_name:
-        raise HTTPException(status_code=400, detail="Missing email or conversation_name")
-    history = get_history(email)
-    new_hist = [conv for conv in history if conv_name not in conv]
-    if len(new_hist) == len(history):
-        raise HTTPException(status_code=404, detail="Conversation not found")
-    save_history(email, new_hist)
-    return {"ok": True, "message": f"Deleted '{conv_name}'", "chat_history": new_hist}
-
-@app.get("/health")
-def health():
-    return {"ok": True, "time": datetime.utcnow().isoformat() + "Z"}
+# OPTIONAL: mount static folder in app (only for small testing; Render may not persist long-term)
+from fastapi.staticfiles import StaticFiles
+app.mount("/static_artifacts", StaticFiles(directory=ARTIFACTS_DIR), name="static_artifacts")
