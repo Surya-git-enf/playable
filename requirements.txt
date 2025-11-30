@@ -1,8 +1,6 @@
 fastapi
 uvicorn
-google-generativeai
-supabase
-feedparser
-requests
-beautifulsoup4
-python-dateutil
+httpx
+python-multipart
+aiofiles
+python-dotenv
