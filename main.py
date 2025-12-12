@@ -84,21 +84,21 @@ def http_get(url: str, headers: Dict[str, str]) -> Dict[str, Any]:
 def create_build_target(repo_url: str, branch: str, build_target_name: str, platform: str) -> Dict[str, Any]:
     """
     Create a build target in Unity Cloud Build.
-    platform: e.g., "WebGL" or "Android"
-    Returns the created build target JSON (including id).
     """
     if not (UNITY_ORG_ID and UNITY_PROJECT_ID):
         raise HTTPException(status_code=500, detail="UNITY_CLOUD_BUILD_ORG_ID or UNITY_CLOUD_BUILD_PROJECT_ID not set")
-    url = f"{UNITY_API_BASE}/orgs/{UNITY_OR_ID}/projects/{UNITY_PROJECT_ID}/buildtargets"
-    # NOTE: Field names may vary depending on Unity API version. This is a best-effort payload.
+
+    # FIXED: UNITY_OR_ID → UNITY_ORG_ID
+    url = f"{UNITY_API_BASE}/orgs/{UNITY_ORG_ID}/projects/{UNITY_PROJECT_ID}/buildtargets"
+
     payload = {
         "name": build_target_name,
         "buildTarget": platform,
         "repositoryType": "git",
         "repository": repo_url,
-        "branch": branch,
-        # minimal settings; Cloud Build may require more fields; if so, check API docs and add them
+        "branch": branch
     }
+
     headers = unity_auth_headers()
     return http_post(url, payload, headers)
 
