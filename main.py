@@ -81,16 +81,25 @@ def http_get(url: str, headers: Dict[str, str]) -> Dict[str, Any]:
 
 
 # --- Core steps: create target, trigger build, wait, share link ---
+# --- inside main.py ---
+
+# ensure DEFAULT_BRANCH is set earlier, for example: DEFAULT_BRANCH = os.getenv("DEFAULT_BRANCH", "main")
+
 def create_build_target(repo_url: str, branch: str, build_target_name: str, platform: str) -> Dict[str, Any]:
     """
     Create a build target in Unity Cloud Build.
+    Must include 'branch' for OAuth/GitHub repos (Unity requires branch).
     """
     if not (UNITY_ORG_ID and UNITY_PROJECT_ID):
         raise HTTPException(status_code=500, detail="UNITY_CLOUD_BUILD_ORG_ID or UNITY_CLOUD_BUILD_PROJECT_ID not set")
 
-    # FIXED: UNITY_OR_ID → UNITY_ORG_ID
+    # ensure branch is provided
+    if not branch:
+        raise HTTPException(status_code=400, detail="Branch is required to create a build target. Provide branch in POST /build as 'branch' (e.g. 'main').")
+
     url = f"{UNITY_API_BASE}/orgs/{UNITY_ORG_ID}/projects/{UNITY_PROJECT_ID}/buildtargets"
 
+    # Include branch explicitly (Unity expects it for oauth/scm)
     payload = {
         "name": build_target_name,
         "buildTarget": platform,
@@ -100,6 +109,7 @@ def create_build_target(repo_url: str, branch: str, build_target_name: str, plat
     }
 
     headers = unity_auth_headers()
+    # call wrapped http_post so errors are converted to HTTPException with Unity body
     return http_post(url, payload, headers)
 
 
