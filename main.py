@@ -159,16 +159,12 @@ def wait_for_build_success(target_id: str, build_number: int, timeout_seconds: i
 
 @app.post("/build")
 def build_endpoint(req: BuildRequest):
-    """
-    Accepts: { "repo_url": "...", "branch": "main", "project_name":"opt", "wait_for_build": false }
-    Steps:
-      1) create WebGL target
-      2) create Android target
-      3) trigger builds
-      4) optionally wait for completion and return share links
-    """
     repo_url = str(req.repo_url)
-    branch = req.branch or DEFAULT_BRANCH
+    # prefer req.branch, fallback to DEFAULT_BRANCH (env)
+    branch = (req.branch or DEFAULT_BRANCH or "").strip()
+    if not branch:
+        # give a clear message so the client knows to include it
+        raise HTTPException(status_code=400, detail="Branch is required in request body or DEFAULT_BRANCH must be set in environment.")
     project_name = req.project_name or "auto-game"
     wait = bool(req.wait_for_build)
 
