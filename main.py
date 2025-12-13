@@ -117,7 +117,7 @@ def create_build_target(repo_url: str, branch: str, name: str, platform: str, un
         "branch": branch,
         "source": {"type": "git", "url": repo_url, "branch": branch},
         "scm": {"type": "git", "url": repo_url, "branch": branch},
-        "settings": {"unityVersion": unity_version}
+        "settings": {"unityVersion": "2022.3.36f1"}
     }
     r = requests.post(url, json=payload, headers=unity_headers(), timeout=60)
     if r.status_code >= 400:
