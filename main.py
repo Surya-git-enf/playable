@@ -54,7 +54,7 @@ def trigger_build(req: BuildRequest):
             "platform": {"bundleId": bundle_id} if bundle_id else {},
             "autoBuild": True,
             "scm": {"type": "git", "branch": branch},
-            "unityVersion": "latest"
+            "unityVersion": "2022.3.0f1"
         }
         payload = {
             "platform": platform.lower(),
