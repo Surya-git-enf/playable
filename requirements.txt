@@ -1,5 +1,5 @@
-fastapi
-uvicorn
-gitpython
-python-multipart
-godot
+fastapi==0.110.0
+uvicorn==0.29.0
+pydantic==2.6.4
+gitpython==3.1.43
+python-multipart==0.0.9
