@@ -1,8 +1,5 @@
 fastapi
 uvicorn
-httpx
+gitpython
 python-multipart
-aiofiles
-python-dotenv
-requests
-
+godot
