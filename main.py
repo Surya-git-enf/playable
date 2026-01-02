@@ -7,12 +7,7 @@ from git import Repo
 from fastapi.staticfiles import StaticFiles
 import subprocess,shutil
 print(subprocess.check_output(["godot", "--version"]).decode())
-@app.get("/debug")
-def debug():
-    return {
-        "godot_path": shutil.which("godot"),
-        "version": subprocess.check_output(["godot", "--version"]).decode()
-    }
+
 GODOT_BIN = os.getenv("GODOT_BIN", "godot")
 BUILD_ROOT = os.getenv("BUILD_ROOT", "/tmp/builds")
 PUBLIC_URL = os.getenv("PUBLIC_URL", "http://localhost:8000")
@@ -22,7 +17,12 @@ os.makedirs(BUILD_ROOT, exist_ok=True)
 app = FastAPI()
 
 app.mount("/builds", StaticFiles(directory=BUILD_ROOT), name="builds")
-
+@app.get("/debug")
+def debug():
+    return {
+        "godot_path": shutil.which("godot"),
+        "version": subprocess.check_output(["godot", "--version"]).decode()
+    }
 class BuildRequest(BaseModel):
     repo_url: str
     game_name: str = "Auto Game"
