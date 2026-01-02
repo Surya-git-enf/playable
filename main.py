@@ -5,9 +5,14 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from git import Repo
 from fastapi.staticfiles import StaticFiles
-import subprocess
+import subprocess,shutil
 print(subprocess.check_output(["godot", "--version"]).decode())
-
+@app.get("/debug")
+def debug():
+    return {
+        "godot_path": shutil.which("godot"),
+        "version": subprocess.check_output(["godot", "--version"]).decode()
+    }
 GODOT_BIN = os.getenv("GODOT_BIN", "godot")
 BUILD_ROOT = os.getenv("BUILD_ROOT", "/tmp/builds")
 PUBLIC_URL = os.getenv("PUBLIC_URL", "http://localhost:8000")
