@@ -1,69 +1,40 @@
-import os
-import uuid
-import subprocess
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI
 from pydantic import BaseModel
-from git import Repo
-from fastapi.staticfiles import StaticFiles
-import subprocess,shutil
-print(subprocess.check_output(["godot", "--version"]).decode())
-
-GODOT_BIN = os.getenv("GODOT_BIN", "godot")
-BUILD_ROOT = os.getenv("BUILD_ROOT", "/tmp/builds")
-PUBLIC_URL = os.getenv("PUBLIC_URL", "http://localhost:8000")
-
-os.makedirs(BUILD_ROOT, exist_ok=True)
+import uuid, json, os
 
 app = FastAPI()
 
-app.mount("/builds", StaticFiles(directory=BUILD_ROOT), name="builds")
-@app.get("/debug")
-def debug():
-    return {
-        "godot_path": shutil.which("godot"),
-        "version": subprocess.check_output(["godot", "--version"]).decode()
-    }
+JOBS_DIR = "jobs"
+os.makedirs(JOBS_DIR, exist_ok=True)
+
 class BuildRequest(BaseModel):
     repo_url: str
-    game_name: str = "Auto Game"
 
 @app.post("/build")
-def build_game(req: BuildRequest):
-    build_id = str(uuid.uuid4())[:8]
-    work_dir = f"{BUILD_ROOT}/{build_id}"
-    export_dir = f"{work_dir}/export"
+def start_build(req: BuildRequest):
+    job_id = f"job_{uuid.uuid4().hex[:8]}"
+    job_file = os.path.join(JOBS_DIR, f"{job_id}.json")
 
-    try:
-        Repo.clone_from(req.repo_url, work_dir)
+    job_data = {
+        "job_id": job_id,
+        "repo_url": req.repo_url,
+        "status": "queued",
+        "output_url": None
+    }
 
-        os.makedirs(export_dir, exist_ok=True)
+    with open(job_file, "w") as f:
+        json.dump(job_data, f)
 
-        # OPTIONAL: modify game logic dynamically
-        main_gd = f"{work_dir}/scripts/main.gd"
-        if os.path.exists(main_gd):
-            with open(main_gd, "a") as f:
-                f.write("\nprint('Game built by backend')\n")
+    return {
+        "job_id": job_id,
+        "status": "queued"
+    }
 
-        # Run Godot export
-        subprocess.run(
-            [
-                GODOT_BIN,
-                "--headless",
-                "--path", work_dir,
-                "--export-release", "Web",
-                f"{export_dir}/index.html"
-            ],
-            check=True
-        )
+@app.get("/status/{job_id}")
+def job_status(job_id: str):
+    job_file = os.path.join(JOBS_DIR, f"{job_id}.json")
+    if not os.path.exists(job_file):
+        return {"error": "job not found"}
 
-        play_url = f"{PUBLIC_URL}/builds/{build_id}/export/index.html"
-
-        return {
-            "status": "success",
-            "play_url": play_url
-        }
-
-    except subprocess.CalledProcessError as e:
-        raise HTTPException(500, f"Godot build failed: {e}")
-    except Exception as e:
-        raise HTTPException(500, str(e))
+    with open(job_file) as f:
+        return json.load(f)
