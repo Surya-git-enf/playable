@@ -1,5 +1,5 @@
 fastapi
 uvicorn
-pydantic
-gitpython
-python-multipart
+redis
+requests
+python-dotenv
