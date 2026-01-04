@@ -72,3 +72,4 @@ EXPOSE 8000
 # Start FastAPI
 # ===============================
 CMD ["uvicorn", "main:app", "--host", "0.0.0.0", "--port", "8000"]
+CMD ["sh", "-c", "python worker.py & uvicorn main:app --host 0.0.0.0 --port $PORT"]
