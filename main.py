@@ -21,8 +21,16 @@ def start_build(req: BuildRequest):
         "status": "queued",
         "output_url": None
     }
+    
+    JOBS_DIR = "/app/jobs"
+    os.makedirs(JOBS_DIR, exist_ok=True)
 
-    with open(job_file, "w") as f:
+    job_data = {
+        "status": "queued",
+        "result": None
+    }
+
+    with open(f"{JOBS_DIR}/{job_id}.json", "w") as f:
         json.dump(job_data, f)
 
     return {
