@@ -1,4 +1,5 @@
 from fastapi import FastAPI, BackgroundTasks
+from pydantic import BaseModel
 import uuid
 import redis
 import os
@@ -10,22 +11,27 @@ REDIS_URL = os.getenv("REDIS_URL")
 r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
 
+class BuildRequest(BaseModel):
+    repo_url: str
+
+
 @app.get("/")
 def home():
     return {"status": "Server running 🚀"}
 
 
-@app.post("/start-job")
-def start_job(background_tasks: BackgroundTasks):
+@app.post("/build")
+def start_build(req: BuildRequest, background_tasks: BackgroundTasks):
     job_id = f"job_{uuid.uuid4().hex[:8]}"
 
-    # save initial status
     r.hset(job_id, mapping={
         "status": "queued",
-        "output": ""
+        "repo_url": req.repo_url,
+        "output_url": "",
+        "error": ""
     })
 
-    background_tasks.add_task(run_job, job_id)
+    background_tasks.add_task(run_job, job_id, req.repo_url)
 
     return {
         "job_id": job_id,
@@ -33,7 +39,7 @@ def start_job(background_tasks: BackgroundTasks):
     }
 
 
-@app.get("/job-status/{job_id}")
+@app.get("/status/{job_id}")
 def job_status(job_id: str):
     if not r.exists(job_id):
         return {"error": "Job not found"}
