@@ -1,66 +1,37 @@
 import os
 import time
-import json
-import subprocess
 import redis
-from datetime import datetime
 
-REDIS_URL = os.environ["REDIS_URL"]
-r = redis.from_url(REDIS_URL, decode_responses=True)
+REDIS_URL = os.getenv("REDIS_URL")
 
-BUILD_DIR = "/app/builds"
-os.makedirs(BUILD_DIR, exist_ok=True)
+r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
-print("Worker started - waiting for jobs...")
+BASE_DIR = "/app/builds"
 
-while True:
-    job_id = r.lpop("job_queue")
-    if not job_id:
-        time.sleep(2)
-        continue
+def run_job(job_id: str):
+    # 1. Make sure builds folder exists
+    os.makedirs(BASE_DIR, exist_ok=True)
 
-    job_key = f"job:{job_id}"
-    job = json.loads(r.get(job_key))
+    # 2. Create job folder
+    job_dir = f"{BASE_DIR}/work_{job_id}"
+    os.makedirs(job_dir, exist_ok=True)
 
-    try:
-        r.hset(job_key, mapping={
-            "status": "building",
-            "started_at": datetime.utcnow().isoformat() + "Z"
-        })
+    # 3. Update status
+    r.hset(job_id, mapping={
+        "status": "running",
+        "output": ""
+    })
 
-        repo = job["repo_url"]
-        workdir = os.path.join(BUILD_DIR, f"work_{job_id}")
+    # 4. Simulate long task
+    time.sleep(5)
 
-        # Clone repo
-        subprocess.run(
-            ["git", "clone", repo, workdir],
-            check=True
-        )
+    # 5. Write output
+    output_file = f"{job_dir}/result.txt"
+    with open(output_file, "w") as f:
+        f.write("Job completed successfully")
 
-        # ✅ CREATE WEB EXPORT DIR (THIS FIXES YOUR ERROR)
-        web_dir = os.path.join(workdir, "web")
-        os.makedirs(web_dir, exist_ok=True)
-
-        # Export WebGL
-        subprocess.run(
-            [
-                "godot",
-                "--headless",
-                "--path", workdir,
-                "--export-release",
-                "Web",
-                os.path.join(web_dir, "index.html")
-            ],
-            check=True
-        )
-
-        r.hset(job_key, mapping={
-            "status": "done",
-            "output_url": f"/outputs/{job_id}/index.html"
-        })
-
-    except Exception as e:
-        r.hset(job_key, mapping={
-            "status": "failed",
-            "error": str(e)
-        })
+    # 6. Save output + status
+    r.hset(job_id, mapping={
+        "status": "completed",
+        "output": output_file
+    })
