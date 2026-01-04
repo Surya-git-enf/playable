@@ -46,3 +46,7 @@ def status(job_id: str):
     if not r.exists(job_key):
         return {"error": "job not found"}
     return r.hgetall(job_key)
+
+@app.get("/debug")
+def debug():
+    return {"status":"Good"}
