@@ -1,44 +1,41 @@
-from fastapi import FastAPI
-from pydantic import BaseModel
-import uuid, json, os
+from fastapi import FastAPI, BackgroundTasks
+import uuid
 import redis
-from datetime import datetime
-
-REDIS_URL = os.environ["REDIS_URL"]
-r = redis.from_url(REDIS_URL, decode_responses=True)
+import os
+from worker import run_job
 
 app = FastAPI()
 
-class BuildRequest(BaseModel):
-    repo_url: str
+REDIS_URL = os.getenv("REDIS_URL")
+r = redis.Redis.from_url(REDIS_URL, decode_responses=True)
 
-@app.post("/build")
-def start_build(req: BuildRequest):
+
+@app.get("/")
+def home():
+    return {"status": "Server running 🚀"}
+
+
+@app.post("/start-job")
+def start_job(background_tasks: BackgroundTasks):
     job_id = f"job_{uuid.uuid4().hex[:8]}"
 
-    job_data = {
-        "job_id": job_id,
-        "repo_url": req.repo_url,
+    # save initial status
+    r.hset(job_id, mapping={
         "status": "queued",
-        "output_url": "",
-        "error": "",
-        "created_at": datetime.utcnow().isoformat() + "Z"
-    }
+        "output": ""
+    })
 
-    # ✅ Save job data
-    r.set(f"job:{job_id}", json.dumps(job_data))
-
-    # ✅ PUSH job into queue (THIS WAS MISSING)
-    r.rpush("job_queue", job_id)
+    background_tasks.add_task(run_job, job_id)
 
     return {
         "job_id": job_id,
         "status": "queued"
     }
 
-@app.get("/status/{job_id}")
+
+@app.get("/job-status/{job_id}")
 def job_status(job_id: str):
-    data = r.get(f"job:{job_id}")
-    if not data:
-        return {"error": "job not found"}
-    return json.loads(data)
+    if not r.exists(job_id):
+        return {"error": "Job not found"}
+
+    return r.hgetall(job_id)
